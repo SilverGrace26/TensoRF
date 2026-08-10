@@ -35,7 +35,8 @@ class TensoRF(eqx.Module):
         self.grid_dim = grid_dim
 
         backend = jax.default_backend()
-        self.compute_dtype = jnp.bfloat16 if backend == "tpu" else jnp.float32
+        # OPTIMIZATION 2: Use float16 on GPU to halve memory bandwidth[cite: 5]
+        self.compute_dtype = jnp.bfloat16 if backend == "tpu" else jnp.float16
 
         self.den_planes, self.den_lines = self.init_tensor_components(
             keys, n_comp_den, 0
@@ -71,51 +72,39 @@ class TensoRF(eqx.Module):
 
     def interpolate_tensor_components(self, xyz_normed, planes, lines):
         grid_dim = self.grid_dim
-        # Scale coordinates to grid indices [0, grid_dim - 1]
         scaled_coords = xyz_normed * (grid_dim - 1)
 
-        # Coordinate extraction for planes (X, Y, Z)
-        # Note: XLA handles these explicit extractions much better than stacked arrays
         x = scaled_coords[..., 0]
         y = scaled_coords[..., 1]
         z = scaled_coords[..., 2]
 
-        # Helper function for fast Bilinear Interpolation
         def bilinear_interp(plane, coord_u, coord_v):
-            # plane shape: (C, H, W)
             u0 = jnp.floor(coord_u).astype(jnp.int32)
             v0 = jnp.floor(coord_v).astype(jnp.int32)
             u1 = u0 + 1
             v1 = v0 + 1
 
-            # Clip to grid boundaries
             u0 = jnp.clip(u0, 0, grid_dim - 1)
             v0 = jnp.clip(v0, 0, grid_dim - 1)
             u1 = jnp.clip(u1, 0, grid_dim - 1)
             v1 = jnp.clip(v1, 0, grid_dim - 1)
 
-            # Gather corner values (vectorized across all C channels automatically)
-            # We use jnp.moveaxis to bring C to the end for easy broadcasting, then move it back
             plane = jnp.moveaxis(plane, 0, -1)
             c00 = plane[v0, u0]
             c01 = plane[v0, u1]
             c10 = plane[v1, u0]
             c11 = plane[v1, u1]
 
-            # Interpolation weights
             wu = jnp.expand_dims(coord_u - u0, axis=-1)
             wv = jnp.expand_dims(coord_v - v0, axis=-1)
 
-            # Compute bilinear combination
             c0 = c00 * (1 - wu) + c01 * wu
             c1 = c10 * (1 - wu) + c11 * wu
             c = c0 * (1 - wv) + c1 * wv
 
-            return jnp.moveaxis(c, -1, 0)  # Return to (C, N_rays)
+            return jnp.moveaxis(c, -1, 0)
 
-        # Helper function for fast Linear Interpolation
         def linear_interp(line, coord):
-            # line shape: (C, H, 1)
             u0 = jnp.floor(coord).astype(jnp.int32)
             u1 = u0 + 1
 
@@ -131,16 +120,12 @@ class TensoRF(eqx.Module):
 
             return jnp.moveaxis(c, -1, 0)
 
-        # Apply interpolations based on the TensoRF projection logic
-        # XY plane & Z line
         plane_xy = bilinear_interp(planes[0], x, y)
         line_z = linear_interp(lines[0], z)
 
-        # XZ plane & Y line
         plane_xz = bilinear_interp(planes[1], x, z)
         line_y = linear_interp(lines[1], y)
 
-        # YZ plane & X line
         plane_yz = bilinear_interp(planes[2], y, z)
         line_x = linear_interp(lines[2], x)
 
@@ -149,20 +134,37 @@ class TensoRF(eqx.Module):
         return results
 
     def get_sigma_feat(self, xyz_normed):
+        """Maintained for backwards compatibility with visualization.py"""
+        den_planes = tuple(x.astype(self.compute_dtype) for x in self.den_planes)
+        den_lines = tuple(x.astype(self.compute_dtype) for x in self.den_lines)
+        app_planes = tuple(x.astype(self.compute_dtype) for x in self.app_planes)
+        app_lines = tuple(x.astype(self.compute_dtype) for x in self.app_lines)
+
         den_components = self.interpolate_tensor_components(
-            xyz_normed, self.den_planes, self.den_lines
+            xyz_normed, den_planes, den_lines
         )
         sigma = sum(jnp.sum(comp, axis=0) for comp in den_components)
         sigma = jax.nn.softplus(sigma) * 5.0
 
         app_components = self.interpolate_tensor_components(
-            xyz_normed, self.app_planes, self.app_lines
+            xyz_normed, app_planes, app_lines
         )
         app_feats = jnp.concatenate(app_components, axis=0).T
         return sigma, app_feats
 
     def __call__(self, rays_o, rays_d, key, bg_color):
         n_samples = 192
+        n_important = (
+            48  # OPTIMIZATION 1: Only evaluate appearance on the top 48 points
+        )
+
+        # 1. Cast params to compute dtype for bandwidth savings[cite: 5]
+        den_planes = tuple(x.astype(self.compute_dtype) for x in self.den_planes)
+        den_lines = tuple(x.astype(self.compute_dtype) for x in self.den_lines)
+        app_planes = tuple(x.astype(self.compute_dtype) for x in self.app_planes)
+        app_lines = tuple(x.astype(self.compute_dtype) for x in self.app_lines)
+
+        # 2. Sample all 192 coarse points[cite: 9]
         pts, z_vals = sample_along_rays(rays_o, rays_d, n_samples, key)
 
         pts_flat = pts.reshape(-1, 3)
@@ -170,27 +172,69 @@ class TensoRF(eqx.Module):
         mask = ((pts_norm > 0.0) & (pts_norm < 1.0)).all(axis=-1)
         pts_norm = jnp.clip(pts_norm, 0.0, 1.0)
 
-        sigma, app_feats = self.get_sigma_feat(pts_norm)
+        # 3. Density-Only Pass (Fast)
+        den_components = self.interpolate_tensor_components(
+            pts_norm, den_planes, den_lines
+        )
+        sigma = sum(jnp.sum(comp, axis=0) for comp in den_components)
+        sigma = jax.nn.softplus(sigma) * 5.0
         sigma = sigma * mask
+        sigma = sigma.reshape(rays_o.shape[0], n_samples)
 
-        app_feats_proj = app_feats @ self.basis_mat
+        # 4. Compute Volume Weights to find surface[cite: 10]
+        dists = z_vals[..., 1:] - z_vals[..., :-1]
+        dists = jnp.concatenate(
+            [dists, jnp.broadcast_to(1e10, dists[..., :1].shape)], -1
+        )
+        dists = dists * jnp.linalg.norm(rays_d[..., None, :], axis=-1)
+
+        alpha = 1.0 - jnp.exp(-sigma * dists)
+        transmittance = jnp.cumprod(1.0 - alpha + 1e-10, axis=-1)
+        weights = alpha * jnp.concatenate(
+            [jnp.ones((alpha.shape[0], 1)), transmittance[..., :-1]], -1
+        )
+
+        # 5. Extract Top-K Important Points
+        _, top_indices = jax.lax.top_k(weights, n_important)
+
+        # We MUST sort the indices to ensure z_vals remain strictly ascending
+        # otherwise alpha composition will break[cite: 10]
+        top_indices = jnp.sort(top_indices, axis=-1)
+
+        batch_indices = jnp.arange(rays_o.shape[0])[:, None]
+        z_vals_imp = z_vals[batch_indices, top_indices]
+        pts_imp = pts[batch_indices, top_indices, :]
+        sigma_imp = sigma[batch_indices, top_indices]
+
+        # 6. Appearance-Only Pass (Heavy - but now 75% smaller!)
+        pts_imp_flat = pts_imp.reshape(-1, 3)
+        pts_imp_norm = self.normalize_coordinates(pts_imp_flat)
+        pts_imp_norm = jnp.clip(pts_imp_norm, 0.0, 1.0)
+
+        app_components = self.interpolate_tensor_components(
+            pts_imp_norm, app_planes, app_lines
+        )
+        app_feats = jnp.concatenate(app_components, axis=0).T
+
+        basis = self.basis_mat.astype(self.compute_dtype)
+        app_feats_proj = app_feats @ basis
 
         view_dirs = rays_d / jnp.linalg.norm(rays_d, axis=-1, keepdims=True)
-        dirs_flat = view_dirs[:, None, :].repeat(n_samples, axis=1).reshape(-1, 3)
-
+        dirs_flat = view_dirs[:, None, :].repeat(n_important, axis=1).reshape(-1, 3)
         dirs_enc = encode_view_directions(dirs_flat)
-        mlp_input = jnp.concatenate([app_feats_proj, dirs_enc], axis=-1)
+        dirs_enc = dirs_enc.astype(self.compute_dtype)
 
-        mlp_input_cast = mlp_input.astype(self.compute_dtype)
-        rgb_flat_cast = jax.vmap(self.mlp_render)(mlp_input_cast)
+        mlp_input = jnp.concatenate([app_feats_proj, dirs_enc], axis=-1)
+        rgb_flat_cast = jax.vmap(self.mlp_render)(mlp_input)
 
         rgb_flat = rgb_flat_cast.astype(jnp.float32)
-        rgb = jax.nn.sigmoid(rgb_flat)
+        rgb_imp = jax.nn.sigmoid(rgb_flat)
+        rgb_imp = rgb_imp.reshape(rays_o.shape[0], n_important, 3)
 
-        sigma = sigma.reshape(rays_o.shape[0], n_samples)
-        rgb = rgb.reshape(rays_o.shape[0], n_samples, 3)
-
-        return compute_volumetric_rendering(rgb, sigma, z_vals, rays_d, bg_color)
+        # 7. Render using only the selected valid points[cite: 10]
+        return compute_volumetric_rendering(
+            rgb_imp, sigma_imp, z_vals_imp, rays_d, bg_color
+        )
 
 
 def upsample_tensoRF(old_model, new_grid_dim, key):
