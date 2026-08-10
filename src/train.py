@@ -55,6 +55,50 @@ def main(args):
     dataset = DataLoader(base_dir=args.data_dir, split="train", half_res=False)
     test_dataset = DataLoader(base_dir=args.data_dir, split="test", half_res=False)
 
+    dataset = DataLoader(base_dir=args.data_dir, split="train", half_res=False)
+    test_dataset = DataLoader(base_dir=args.data_dir, split="test", half_res=False)
+
+    if args.verbose:
+        print("\n" + "-" * 60)
+        print("🔍 VERBOSE DIAGNOSTICS: Coordinate & Pipeline Audit")
+
+        train_centers = dataset.poses[:, :3, 3]
+        test_centers = test_dataset.poses[:, :3, 3]
+
+        # In standard NeRF (OpenGL format): Col 0 = Right, Col 1 = Up, Col 2 = -Forward
+        train_up = dataset.poses[:, :3, 1].mean(axis=0)
+        train_forward = -dataset.poses[:, :3, 2].mean(axis=0)
+        test_up = test_dataset.poses[:, :3, 1].mean(axis=0)
+
+        print(f"Train Camera Bounding Box:")
+        print(f"  Min: {train_centers.min(axis=0).round(3)}")
+        print(f"  Max: {train_centers.max(axis=0).round(3)}")
+        print(f"Test Camera Bounding Box:")
+        print(f"  Min: {test_centers.min(axis=0).round(3)}")
+        print(f"  Max: {test_centers.max(axis=0).round(3)}")
+
+        print(f"\nAverage Camera Directions:")
+        print(f"  Train 'Up' Vector      : {train_up.round(3)}")
+        print(f"  Train 'Forward' Vector : {train_forward.round(3)}")
+
+        up_dot_product = np.dot(train_up, test_up)
+        print(
+            f"\nTrain/Test Up-Vector Alignment: {up_dot_product:.3f} (Should be ~1.0)"
+        )
+        if up_dot_product < 0.9:
+            print(
+                "  ⚠️ WARNING: Train and Test cameras might be using different coordinate systems!"
+            )
+
+        print(f"\nImage Channels:")
+        print(
+            f"  Train shape: {dataset.imgs.shape} | Alpha present: {dataset.imgs.shape[-1] == 4}"
+        )
+        print(
+            f"  Test shape:  {test_dataset.imgs.shape} | Alpha present: {test_dataset.imgs.shape[-1] == 4}"
+        )
+        print("-" * 60 + "\n")
+
     os.makedirs(args.ckpt_dir, exist_ok=True)
     ckpt_prefix = os.path.join(args.ckpt_dir, "tensorf_ckpt")
 
@@ -284,6 +328,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--init_grid_dim", type=int, default=128, help="Initial tensor grid size"
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print detailed diagnostic logs before training",
+    )
+
     args = parser.parse_args()
 
     main(args)
