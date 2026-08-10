@@ -11,11 +11,32 @@ import jax.numpy as jnp
 import equinox as eqx
 import optax
 
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
 from core.dataset import DataLoader
 from core.losses import loss_fn
 from core.engine import pmap_train_block, restore_step_count
 from model.tensorf import TensoRF, upsample_tensoRF
 from visualization import evaluate_test_psnr
+
+
+def device_put_sharded(shards, devices):
+    """Drop-in replacement for jax.device_put_sharded"""
+    mesh = Mesh(np.array(devices), ("x",))
+    sharding = NamedSharding(mesh, P("x"))
+    return jax.tree.map(lambda *xs: jax.device_put(jnp.stack(xs), sharding), *shards)
+
+
+def device_put_replicated(tree, devices):
+    """Drop-in replacement for jax.device_put_replicated"""
+    mesh = Mesh(np.array(devices), ("x",))
+    sharding = NamedSharding(mesh, P("x"))
+    return jax.tree.map(
+        lambda x: jax.device_put(
+            jnp.broadcast_to(x, (len(devices),) + x.shape), sharding
+        ),
+        tree,
+    )
 
 
 def main(args):
@@ -24,7 +45,7 @@ def main(args):
     n_devices = len(devices)
 
     print("\n" + "=" * 50)
-    print(f"🔥 Hardware Detected: {backend.upper()} with {n_devices} core(s).")
+    print(f"Hardware Detected: {backend.upper()} with {n_devices} core(s).")
     if backend == "cpu":
         print(
             "⚠️  WARNING: JAX is running on CPU! Double check your Kaggle environment and JAX installation."
@@ -145,14 +166,14 @@ def main(args):
     imgs_jax = jnp.array(dataset.imgs)
     poses_jax = jnp.array(dataset.poses)
 
-    params_rep = jax.device_put_replicated(params, devices)
-    opt_state_rep = jax.device_put_replicated(opt_state, devices)
+    params_rep = device_put_replicated(params, devices)
+    opt_state_rep = device_put_replicated(opt_state, devices)
 
     print("Starting optimized block loop...")
     start_time = time.time()
 
     device_keys_list = list(jax.random.split(train_key, n_devices))
-    device_keys = jax.device_put_sharded(device_keys_list, devices)
+    device_keys = device_put_sharded(device_keys_list, devices)
 
     for next_upsample in schedule:
         steps_to_run = next_upsample - current_step
@@ -213,8 +234,8 @@ def main(args):
             old_state_single = jax.tree_util.tree_map(lambda x: x[0], opt_state_rep)
             opt_state = restore_step_count(new_opt_state, old_state_single)
 
-            params_rep = jax.device_put_replicated(params, devices)
-            opt_state_rep = jax.device_put_replicated(opt_state, devices)
+            params_rep = device_put_replicated(params, devices)
+            opt_state_rep = device_put_replicated(opt_state, devices)
             initial_grid_dim = new_dim
 
         print(f"Saving checkpoint at step {current_step}...")
