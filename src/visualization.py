@@ -159,7 +159,13 @@ def render_360_video(model, dataset, out_dir, n_frames=30, chunk=8192):
     print("\n→ Rendering 360° video frames…")
     H, W = dataset.H, dataset.W
     base_pose = dataset.poses[0]
-    radius = np.linalg.norm(base_pose[:3, 3])
+
+    # Calculate radius purely in the XY plane to maintain a perfect circular orbit
+    xy_radius = np.sqrt(base_pose[0, 3] ** 2 + base_pose[1, 3] ** 2)
+
+    # Extract the Z-height so the camera stays at the correct elevation
+    z_elevation = base_pose[2, 3]
+
     render_chunk = make_render_chunk_for_model(model)
 
     def get_rays(pose):
@@ -179,13 +185,19 @@ def render_360_video(model, dataset, out_dir, n_frames=30, chunk=8192):
     for idx, theta in enumerate(
         tqdm(np.linspace(0, 2 * np.pi, n_frames, endpoint=False))
     ):
+        # Orbit in the XY plane while keeping the Z height locked
         cam = np.array(
-            [radius * np.sin(theta), base_pose[1, 3], radius * np.cos(theta)]
+            [xy_radius * np.cos(theta), xy_radius * np.sin(theta), z_elevation]
         )
 
+        # Point the camera inward toward the origin
         forward = -cam / np.linalg.norm(cam)
-        right = np.cross(np.array([0, 1, 0]), forward)
+
+        # Use Z-axis (0, 0, 1) as the world 'up' vector for the cross product
+        right = np.cross(np.array([0, 0, 1]), forward)
         right /= np.linalg.norm(right)
+
+        # Calculate the camera's true up vector relative to its tilt
         up = np.cross(forward, right)
 
         pose = np.eye(4)
@@ -205,4 +217,5 @@ def render_360_video(model, dataset, out_dir, n_frames=30, chunk=8192):
         img = jnp.concatenate(rgb_parts, axis=0).reshape(H, W, 3)
         img = np.clip(np.array(img), 0, 1)
         imageio.imwrite(f"{out_dir}/frame_{idx:03d}.jpg", (img * 255).astype(np.uint8))
+
     print(f"✔ Frames saved → {out_dir}")
