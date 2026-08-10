@@ -24,7 +24,15 @@ def evaluate_test_psnr(params, static, test_dataset, key):
 
     for i in range(test_dataset.N):
         rays_o, rays_d = test_dataset.get_full_image_rays(i)
-        target_rgb = test_dataset.imgs[i, ..., :3]
+        selected_px = test_dataset.imgs[i]
+
+        # Apply the exact same alpha blending used in training
+        if selected_px.shape[-1] == 4:
+            alpha = selected_px[..., 3:4]
+            white_bg = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+            target_rgb = selected_px[..., :3] * alpha + white_bg * (1.0 - alpha)
+        else:
+            target_rgb = selected_px[..., :3]
 
         flat_o = rays_o.reshape(-1, 3)
         flat_d = rays_d.reshape(-1, 3)
