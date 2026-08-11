@@ -8,15 +8,16 @@ from tqdm import tqdm
 from functools import partial
 
 
-def evaluate_test_psnr(params, static, test_dataset, key):
+def evaluate_test_psnr(params, static, test_dataset, key=None):
     print("\n--- Running Test Set Evaluation ---")
 
     model_infer = eqx.combine(params, static)
 
     @jax.jit
-    def render_chunk(rays_o_chunk, rays_d_chunk, rng):
+    def render_chunk(rays_o_chunk, rays_d_chunk):
         bg_color = jnp.array([1.0, 1.0, 1.0])
-        rgb, _, _ = model_infer(rays_o_chunk, rays_d_chunk, rng, bg_color)
+        # Pass None for key to ensure deterministic ray sampling during test evaluation
+        rgb, _, _ = model_infer(rays_o_chunk, rays_d_chunk, None, bg_color)
         return rgb
 
     chunk_size = 8192
@@ -43,8 +44,7 @@ def evaluate_test_psnr(params, static, test_dataset, key):
             chunk_o = jnp.array(flat_o[k : k + chunk_size])
             chunk_d = jnp.array(flat_d[k : k + chunk_size])
 
-            key, subkey = jax.random.split(key)
-            rgb_chunk = render_chunk(chunk_o, chunk_d, subkey)
+            rgb_chunk = render_chunk(chunk_o, chunk_d)
             pred_rgb_chunks.append(rgb_chunk)
 
         img_pred = jnp.concatenate(pred_rgb_chunks, axis=0)
@@ -168,10 +168,7 @@ def render_360_video(model, dataset, out_dir, n_frames=30, chunk=8192):
     H, W = dataset.H, dataset.W
     base_pose = dataset.poses[0]
 
-    # Calculate radius purely in the XY plane to maintain a perfect circular orbit
     xy_radius = np.sqrt(base_pose[0, 3] ** 2 + base_pose[1, 3] ** 2)
-
-    # Extract the Z-height so the camera stays at the correct elevation
     z_elevation = base_pose[2, 3]
 
     render_chunk = make_render_chunk_for_model(model)
@@ -193,19 +190,13 @@ def render_360_video(model, dataset, out_dir, n_frames=30, chunk=8192):
     for idx, theta in enumerate(
         tqdm(np.linspace(0, 2 * np.pi, n_frames, endpoint=False))
     ):
-        # Orbit in the XY plane while keeping the Z height locked
         cam = np.array(
             [xy_radius * np.cos(theta), xy_radius * np.sin(theta), z_elevation]
         )
 
-        # Point the camera inward toward the origin
         forward = -cam / np.linalg.norm(cam)
-
-        # Use Z-axis (0, 0, 1) as the world 'up' vector for the cross product
         right = np.cross(np.array([0, 0, 1]), forward)
         right /= np.linalg.norm(right)
-
-        # Calculate the camera's true up vector relative to its tilt
         up = np.cross(forward, right)
 
         pose = np.eye(4)
