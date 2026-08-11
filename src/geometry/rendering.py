@@ -1,11 +1,7 @@
 import jax.numpy as jnp
 
 
-def compute_volumetric_rendering(rgb, sigma, z_vals, rays_d, bg_color):
-    dists = z_vals[..., 1:] - z_vals[..., :-1]
-    dists = jnp.concatenate([dists, jnp.broadcast_to(1e10, dists[..., :1].shape)], -1)
-    dists = dists * jnp.linalg.norm(rays_d[..., None, :], axis=-1)
-
+def compute_volumetric_rendering(rgb, sigma, dists, z_vals, bg_color):
     alpha = 1.0 - jnp.exp(-sigma * dists)
     transmittance = jnp.cumprod(1.0 - alpha + 1e-10, axis=-1)
     weights = alpha * jnp.concatenate(
