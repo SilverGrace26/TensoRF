@@ -35,7 +35,6 @@ class TensoRF(eqx.Module):
         self.grid_dim = grid_dim
 
         backend = jax.default_backend()
-        # OPTIMIZATION 2: Use float16 on GPU to halve memory bandwidth[cite: 5]
         self.compute_dtype = jnp.bfloat16 if backend == "tpu" else jnp.float16
 
         self.den_planes, self.den_lines = self.init_tensor_components(
@@ -154,17 +153,15 @@ class TensoRF(eqx.Module):
 
     def __call__(self, rays_o, rays_d, key, bg_color):
         n_samples = 192
-        n_important = (
-            48  # OPTIMIZATION 1: Only evaluate appearance on the top 48 points
-        )
+        n_important = 48
 
-        # 1. Cast params to compute dtype for bandwidth savings[cite: 5]
+        # 1. Cast params to compute dtype for bandwidth savings
         den_planes = tuple(x.astype(self.compute_dtype) for x in self.den_planes)
         den_lines = tuple(x.astype(self.compute_dtype) for x in self.den_lines)
         app_planes = tuple(x.astype(self.compute_dtype) for x in self.app_planes)
         app_lines = tuple(x.astype(self.compute_dtype) for x in self.app_lines)
 
-        # 2. Sample all 192 coarse points[cite: 9]
+        # 2. Sample all 192 coarse points
         pts, z_vals = sample_along_rays(rays_o, rays_d, n_samples, key)
 
         pts_flat = pts.reshape(-1, 3)
@@ -172,7 +169,7 @@ class TensoRF(eqx.Module):
         mask = ((pts_norm > 0.0) & (pts_norm < 1.0)).all(axis=-1)
         pts_norm = jnp.clip(pts_norm, 0.0, 1.0)
 
-        # 3. Density-Only Pass (Fast)
+        # 3. Density-Only Pass
         den_components = self.interpolate_tensor_components(
             pts_norm, den_planes, den_lines
         )
@@ -181,7 +178,7 @@ class TensoRF(eqx.Module):
         sigma = sigma * mask
         sigma = sigma.reshape(rays_o.shape[0], n_samples)
 
-        # 4. Compute Volume Weights to find surface[cite: 10]
+        # 4. Compute Volume Weights using exact step distances
         dists = z_vals[..., 1:] - z_vals[..., :-1]
         dists = jnp.concatenate(
             [dists, jnp.broadcast_to(1e10, dists[..., :1].shape)], -1
@@ -196,17 +193,15 @@ class TensoRF(eqx.Module):
 
         # 5. Extract Top-K Important Points
         _, top_indices = jax.lax.top_k(weights, n_important)
-
-        # We MUST sort the indices to ensure z_vals remain strictly ascending
-        # otherwise alpha composition will break[cite: 10]
         top_indices = jnp.sort(top_indices, axis=-1)
 
         batch_indices = jnp.arange(rays_o.shape[0])[:, None]
         z_vals_imp = z_vals[batch_indices, top_indices]
         pts_imp = pts[batch_indices, top_indices, :]
         sigma_imp = sigma[batch_indices, top_indices]
+        dists_imp = dists[batch_indices, top_indices]  # True step distances
 
-        # 6. Appearance-Only Pass (Heavy - but now 75% smaller!)
+        # 6. Appearance-Only Pass
         pts_imp_flat = pts_imp.reshape(-1, 3)
         pts_imp_norm = self.normalize_coordinates(pts_imp_flat)
         pts_imp_norm = jnp.clip(pts_imp_norm, 0.0, 1.0)
@@ -231,9 +226,9 @@ class TensoRF(eqx.Module):
         rgb_imp = jax.nn.sigmoid(rgb_flat)
         rgb_imp = rgb_imp.reshape(rays_o.shape[0], n_important, 3)
 
-        # 7. Render using only the selected valid points[cite: 10]
+        # 7. Render using pre-computed true step distances
         return compute_volumetric_rendering(
-            rgb_imp, sigma_imp, z_vals_imp, rays_d, bg_color
+            rgb_imp, sigma_imp, dists_imp, z_vals_imp, bg_color
         )
 
 
