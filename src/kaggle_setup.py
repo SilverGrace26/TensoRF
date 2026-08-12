@@ -1,4 +1,4 @@
-# setup_env.py
+# kaggle_setup.py
 import os
 import sys
 import subprocess
@@ -39,8 +39,9 @@ def main():
         run_cmd(
             f'{sys.executable} -m pip install -U -q "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html'
         )
+        # JAX and JAXLIB removed from this line to prevent version conflicts
         run_cmd(
-            f'{sys.executable} -m pip install --upgrade equinox jax jaxlib optax "numpy<2.0.0"'
+            f'{sys.executable} -m pip install --upgrade equinox optax "numpy<2.0.0"'
         )
 
     elif accelerator == "GPU":
@@ -55,7 +56,7 @@ def main():
             f'{sys.executable} -m pip install --upgrade jax jaxlib equinox optax "numpy<2.0.0"'
         )
 
-    run_cmd(f"{sys.executable} -m pip install imageio matplotlib tqdm")
+    run_cmd(f'{sys.executable} -m pip install imageio "matplotlib<3.9.0" tqdm')
     print("\n Environment Setup Complete!")
 
 
