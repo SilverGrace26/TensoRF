@@ -22,12 +22,16 @@ def test_volumetric_rendering():
     sigma = jnp.ones((n_rays, n_samples)) * 0.1
     z_vals = jnp.linspace(0.2, 6.0, n_samples)
     z_vals = jnp.broadcast_to(z_vals, (n_rays, n_samples))
-    rays_d = jnp.ones((n_rays, 3))
+
+    # 1. Create dummy distances between samples for the test
+    step_size = (6.0 - 0.2) / n_samples
+    dists = jnp.ones((n_rays, n_samples)) * step_size
+
     bg_color = jnp.array([1.0, 1.0, 1.0])
 
-    # Test rendering logic[cite: 10]
+    # 2. Pass dists and z_vals in the correct order (and drop rays_d)
     rgb_out, depth_map, weights = compute_volumetric_rendering(
-        rgb, sigma, z_vals, rays_d, bg_color
+        rgb, sigma, dists, z_vals, bg_color
     )
 
     assert rgb_out.shape == (n_rays, 3)
