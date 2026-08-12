@@ -30,33 +30,38 @@ def main():
     accelerator = detect_accelerator()
     print(f" Detected Accelerator: {accelerator}\n")
 
-    run_cmd(f"{sys.executable} -m pip install --upgrade pip")
-    run_cmd(f"{sys.executable} -m pip uninstall -y tensorflow")
+    # 1. Install uv
+    print("Installing uv for strict dependency resolution...")
+    run_cmd(f"{sys.executable} -m pip install uv")
 
+    uv_cmd = f"{sys.executable} -m uv pip install --system"
+
+    # 2. Clear out Kaggle's pre-existing conflicting system packages
+    print("Uninstalling conflicting system packages...")
+    run_cmd(f"{sys.executable} -m pip uninstall -y tensorflow numpy matplotlib")
+
+    # 3. Fast, single-pass reproducible installations using uv
     if accelerator == "TPU":
-        print("Installing JAX for TPU...")
-        run_cmd(f"{sys.executable} -m pip install -q requests")
+        print("Installing JAX for TPU using uv...")
+        run_cmd(f"{uv_cmd} requests")
+        # Combined into one resolution pass!
         run_cmd(
-            f'{sys.executable} -m pip install -U -q "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html'
-        )
-        # JAX and JAXLIB removed from this line to prevent version conflicts
-        run_cmd(
-            f'{sys.executable} -m pip install --upgrade equinox optax "numpy<2.0.0"'
+            f'{uv_cmd} -U "jax[tpu]" equinox optax "numpy<2.0.0" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html'
         )
 
     elif accelerator == "GPU":
-        print("Installing JAX for GPU (CUDA 12)...")
-        run_cmd(f'{sys.executable} -m pip install --upgrade "jax[cuda12]"')
-        run_cmd(f'{sys.executable} -m pip install "numpy<2.0.0" --force-reinstall')
-        run_cmd(f"{sys.executable} -m pip install equinox jaxlib optax")
+        print("Installing JAX for GPU (CUDA 12) using uv...")
+        # Combined into one resolution pass!
+        run_cmd(f'{uv_cmd} -U "jax[cuda12]" equinox optax "numpy<2.0.0"')
 
     else:
-        print("No accelerator detected. Installing standard CPU JAX...")
-        run_cmd(
-            f'{sys.executable} -m pip install --upgrade jax jaxlib equinox optax "numpy<2.0.0"'
-        )
+        print("No accelerator detected. Installing standard CPU JAX using uv...")
+        run_cmd(f'{uv_cmd} -U jax jaxlib equinox optax "numpy<2.0.0"')
 
-    run_cmd(f'{sys.executable} -m pip install imageio "matplotlib<3.9.0" tqdm')
+    # 4. Install remaining dependencies with strict limits
+    print("Resolving and installing standard dependencies...")
+    run_cmd(f'{uv_cmd} imageio "matplotlib<3.9.0" tqdm')
+
     print("\n Environment Setup Complete!")
 
 
