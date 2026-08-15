@@ -35,7 +35,12 @@ def main(args):
         meta = json.load(f)
 
     key = jax.random.PRNGKey(0)
-    model = TensoRF(key, grid_dim=meta["grid_dim"])
+    model = TensoRF(
+        key,
+        grid_dim=meta["grid_dim"],
+        n_comp_den=meta.get("n_comp_den", [8, 8, 8]),
+        n_comp_app=meta.get("n_comp_app", [24, 24, 24]),
+    )
     model = eqx.tree_deserialise_leaves(ckpt_prefix + "_model.eqx", model)
     print(f"✔ Model loaded successfully (grid size: {meta['grid_dim']})")
 

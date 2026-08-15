@@ -16,7 +16,6 @@ def evaluate_test_psnr(params, static, test_dataset, key=None):
     @jax.jit
     def render_chunk(rays_o_chunk, rays_d_chunk):
         bg_color = jnp.array([1.0, 1.0, 1.0])
-        # Pass None for key to ensure deterministic ray sampling during test evaluation
         rgb, _, _ = model_infer(rays_o_chunk, rays_d_chunk, None, bg_color)
         return rgb
 
@@ -25,15 +24,7 @@ def evaluate_test_psnr(params, static, test_dataset, key=None):
 
     for i in range(test_dataset.N):
         rays_o, rays_d = test_dataset.get_full_image_rays(i)
-        selected_px = test_dataset.imgs[i]
-
-        # Apply the exact same alpha blending used in training
-        if selected_px.shape[-1] == 4:
-            alpha = selected_px[..., 3:4]
-            white_bg = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-            target_rgb = selected_px[..., :3] * alpha + white_bg * (1.0 - alpha)
-        else:
-            target_rgb = selected_px[..., :3]
+        target_rgb = test_dataset.imgs[i]
 
         flat_o = rays_o.reshape(-1, 3)
         flat_d = rays_d.reshape(-1, 3)

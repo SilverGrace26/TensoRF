@@ -2,7 +2,9 @@ import jax
 import jax.numpy as jnp
 
 
-def sample_batch_on_device(key, imgs, poses, focal, H, W, is_precrop, batch_size):
+def sample_batch_on_device(
+    key, imgs, rays_o_all, rays_d_all, H, W, is_precrop, batch_size
+):
     k1, k2, k3 = jax.random.split(key, 3)
     N = imgs.shape[0]
 
@@ -20,23 +22,9 @@ def sample_batch_on_device(key, imgs, poses, focal, H, W, is_precrop, batch_size
     js = jax.random.randint(k2, (batch_size,), min_h, max_h)
     is_ = jax.random.randint(k3, (batch_size,), min_w, max_w)
 
-    dirs = jnp.stack(
-        [
-            (is_ - W * 0.5) / focal,
-            -(js - H * 0.5) / focal,
-            -jnp.ones_like(is_, dtype=jnp.float32),
-        ],
-        axis=-1,
-    )
-
-    rays_o = poses[img_ids, :3, 3]
-    R = poses[img_ids, :3, :3]
-    rays_d = jnp.einsum("...i,...ji->...j", dirs, R)
-
-    selected_px = imgs[img_ids, js, is_, :]
-    alpha = selected_px[..., 3:4]
-    white_bg = jnp.array([1.0, 1.0, 1.0], dtype=jnp.float32)
-    gt_rgb = selected_px[..., :3] * alpha + white_bg * (1.0 - alpha)
+    rays_o = rays_o_all[img_ids, js, is_, :]
+    rays_d = rays_d_all[img_ids, js, is_, :]
+    gt_rgb = imgs[img_ids, js, is_, :]
 
     return rays_o, rays_d, gt_rgb
 

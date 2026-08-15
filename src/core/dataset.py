@@ -35,6 +35,12 @@ class DataLoader:
         self.imgs = (np.array(imgs) / 255.0).astype(np.float32)
         self.poses = np.array(poses).astype(np.float32)
 
+        # Pre-blend alpha channel with white background
+        if self.imgs.shape[-1] == 4:
+            print("Pre-blending alpha channel with white background...")
+            alpha = self.imgs[..., 3:4]
+            self.imgs = self.imgs[..., :3] * alpha + (1.0 - alpha)
+
         H, W = self.imgs[0].shape[:2]
         if self.half_res:
             H, W = H // 2, W // 2
@@ -46,8 +52,8 @@ class DataLoader:
             f"Loaded {self.N} images: shape {self.imgs.shape}, focal={self.focal:.2f}"
         )
 
-    def get_full_image_rays(self, idx):
-        pose = self.poses[idx]
+        # Pre-compute all rays
+        print(f"Pre-computing all rays for {self.split} split...")
         i, j = np.meshgrid(
             np.arange(self.W, dtype=np.float32),
             np.arange(self.H, dtype=np.float32),
@@ -61,6 +67,13 @@ class DataLoader:
             ],
             -1,
         )
-        rays_d = np.sum(dirs[..., np.newaxis, :] * pose[:3, :3], -1)
-        rays_o = np.broadcast_to(pose[:3, 3], rays_d.shape)
-        return rays_o, rays_d
+
+        dirs = np.broadcast_to(dirs, (self.N, self.H, self.W, 3))
+        self.rays_d = np.einsum("nhwi,nji->nhwj", dirs, self.poses[:, :3, :3])
+        self.rays_o = np.broadcast_to(
+            self.poses[:, None, None, :3, 3], self.rays_d.shape
+        )
+        print("Ray pre-computation complete.")
+
+    def get_full_image_rays(self, idx):
+        return self.rays_o[idx], self.rays_d[idx]

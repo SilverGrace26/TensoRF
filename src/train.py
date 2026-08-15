@@ -23,14 +23,12 @@ from visualization import evaluate_test_psnr
 
 
 def device_put_sharded(shards, devices):
-    """Drop-in replacement for jax.device_put_sharded"""
     mesh = Mesh(np.array(devices), ("x",))
     sharding = NamedSharding(mesh, P("x"))
     return jax.tree.map(lambda *xs: jax.device_put(jnp.stack(xs), sharding), *shards)
 
 
 def device_put_replicated(tree, devices):
-    """Drop-in replacement for jax.device_put_replicated"""
     mesh = Mesh(np.array(devices), ("x",))
     sharding = NamedSharding(mesh, P("x"))
     return jax.tree.map(
@@ -54,25 +52,16 @@ def main(args):
         )
     print("=" * 50 + "\n")
 
-    # ---------------------------------------------------------
-    # REMOTE MLFLOW TRACKING (DAGSHUB) SETUP
-    # ---------------------------------------------------------
-    # The DAGSHUB_USER_TOKEN environment variable is handled externally in your notebook.
     dagshub.init(repo_owner="silvergrace26", repo_name="TensoRF", mlflow=True)
-    # ---------------------------------------------------------
-
-    # Set up MLflow tracking
     mlflow.set_experiment("TensoRF_JAX_Training")
 
     with mlflow.start_run(
         run_name=f"TensoRF_grid{args.init_grid_dim}_iters{args.n_iters}"
     ):
-        # Log all CLI arguments
         mlflow.log_params(vars(args))
         mlflow.log_param("backend", backend)
         mlflow.log_param("n_devices", n_devices)
 
-        # Bump components for VM-192 capacity (No artificial dataset hacks)
         n_comp_den = [16, 16, 16]
         n_comp_app = [48, 48, 48]
         mlflow.log_param("n_comp_den", n_comp_den)
@@ -113,12 +102,8 @@ def main(args):
                 )
 
             print(f"\nImage Channels:")
-            print(
-                f"  Train shape: {dataset.imgs.shape} | Alpha present: {dataset.imgs.shape[-1] == 4}"
-            )
-            print(
-                f"  Test shape:  {test_dataset.imgs.shape} | Alpha present: {test_dataset.imgs.shape[-1] == 4}"
-            )
+            print(f"  Train shape: {dataset.imgs.shape}")
+            print(f"  Test shape:  {test_dataset.imgs.shape}")
             print("-" * 60 + "\n")
 
         os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -238,9 +223,10 @@ def main(args):
         print("-------------------------------------------\n")
 
         print("Replicating parameters across hardware devices...")
-        focal, H, W = dataset.focal, dataset.H, dataset.W
+        H, W = dataset.H, dataset.W
         imgs_jax = jnp.array(dataset.imgs)
-        poses_jax = jnp.array(dataset.poses)
+        rays_o_jax = jnp.array(dataset.rays_o)
+        rays_d_jax = jnp.array(dataset.rays_d)
 
         params_rep = device_put_replicated(params, devices)
         opt_state_rep = device_put_replicated(opt_state, devices)
@@ -274,8 +260,8 @@ def main(args):
                 static,
                 device_keys,
                 imgs_jax,
-                poses_jax,
-                focal,
+                rays_o_jax,
+                rays_d_jax,
                 H,
                 W,
                 steps_to_run,
@@ -293,7 +279,6 @@ def main(args):
                 f"Reached Step {next_upsample} | Final Step Loss: {final_loss:.5f} | PSNR: {psnr:.2f} dB | Time: {time.time() - start_time:.1f}s"
             )
 
-            # Log metrics to MLflow
             mlflow.log_metrics(
                 {
                     "train_loss": final_loss,
@@ -335,7 +320,15 @@ def main(args):
             eqx.tree_serialise_leaves(ckpt_prefix + "_opt.eqx", opt_state_single)
 
             with open(ckpt_prefix + "_meta.json", "w") as f:
-                json.dump({"step": current_step, "grid_dim": initial_grid_dim}, f)
+                json.dump(
+                    {
+                        "step": current_step,
+                        "grid_dim": initial_grid_dim,
+                        "n_comp_den": n_comp_den,
+                        "n_comp_app": n_comp_app,
+                    },
+                    f,
+                )
             print("Checkpoint saved successfully.")
 
         print("\n============================================================")
@@ -346,7 +339,6 @@ def main(args):
         params_final = jax.tree_util.tree_map(lambda x: x[0], params_rep)
         test_psnr = evaluate_test_psnr(params_final, static, test_dataset)
 
-        # Log the final test result
         mlflow.log_metric("test_psnr", test_psnr, step=args.n_iters)
 
 

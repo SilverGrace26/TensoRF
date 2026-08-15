@@ -37,8 +37,8 @@ def pmap_train_block(
     static,
     rng,
     imgs,
-    poses,
-    focal,
+    rays_o_all,
+    rays_d_all,
     H,
     W,
     num_steps,
@@ -53,7 +53,14 @@ def pmap_train_block(
         current_rng, sample_key, model_key = jax.random.split(current_rng, 3)
 
         rays_o, rays_d, target_rgb = sample_batch_on_device(
-            sample_key, imgs, poses, focal, H, W, is_precrop, batch_size_per_device
+            sample_key,
+            imgs,
+            rays_o_all,
+            rays_d_all,
+            H,
+            W,
+            is_precrop,
+            batch_size_per_device,
         )
 
         model_local = eqx.combine(p, static)

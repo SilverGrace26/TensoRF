@@ -67,11 +67,11 @@ class TensoRF(eqx.Module):
     def normalize_coordinates(self, xyz):
         min_b = jax.lax.stop_gradient(self.bbox_min)
         max_b = jax.lax.stop_gradient(self.bbox_max)
-        return (xyz - min_b) / (max_b - min_b)
+        return jax.lax.stop_gradient((xyz - min_b) / (max_b - min_b))
 
     def interpolate_tensor_components(self, xyz_normed, planes, lines):
         grid_dim = self.grid_dim
-        scaled_coords = xyz_normed * (grid_dim - 1)
+        scaled_coords = jax.lax.stop_gradient(xyz_normed * (grid_dim - 1))
 
         x = scaled_coords[..., 0]
         y = scaled_coords[..., 1]
@@ -133,7 +133,6 @@ class TensoRF(eqx.Module):
         return results
 
     def get_sigma_feat(self, xyz_normed):
-        """Maintained for backwards compatibility with visualization.py"""
         den_planes = tuple(x.astype(self.compute_dtype) for x in self.den_planes)
         den_lines = tuple(x.astype(self.compute_dtype) for x in self.den_lines)
         app_planes = tuple(x.astype(self.compute_dtype) for x in self.app_planes)
@@ -155,30 +154,27 @@ class TensoRF(eqx.Module):
         n_samples = 192
         n_important = 48
 
-        # 1. Cast params to compute dtype for bandwidth savings
         den_planes = tuple(x.astype(self.compute_dtype) for x in self.den_planes)
         den_lines = tuple(x.astype(self.compute_dtype) for x in self.den_lines)
         app_planes = tuple(x.astype(self.compute_dtype) for x in self.app_planes)
         app_lines = tuple(x.astype(self.compute_dtype) for x in self.app_lines)
 
-        # 2. Sample all 192 coarse points
         pts, z_vals = sample_along_rays(rays_o, rays_d, n_samples, key)
 
         pts_flat = pts.reshape(-1, 3)
         pts_norm = self.normalize_coordinates(pts_flat)
-        mask = ((pts_norm > 0.0) & (pts_norm < 1.0)).all(axis=-1)
+        mask = jax.lax.stop_gradient(((pts_norm > 0.0) & (pts_norm < 1.0)).all(axis=-1))
         pts_norm = jnp.clip(pts_norm, 0.0, 1.0)
 
-        # 3. Density-Only Pass
         den_components = self.interpolate_tensor_components(
             pts_norm, den_planes, den_lines
         )
         sigma = sum(jnp.sum(comp, axis=0) for comp in den_components)
         sigma = jax.nn.softplus(sigma) * 5.0
+
         sigma = sigma * mask
         sigma = sigma.reshape(rays_o.shape[0], n_samples)
 
-        # 4. Compute Volume Weights using exact step distances
         dists = z_vals[..., 1:] - z_vals[..., :-1]
         dists = jnp.concatenate(
             [dists, jnp.broadcast_to(1e10, dists[..., :1].shape)], -1
@@ -191,7 +187,6 @@ class TensoRF(eqx.Module):
             [jnp.ones((alpha.shape[0], 1)), transmittance[..., :-1]], -1
         )
 
-        # 5. Extract Top-K Important Points
         _, top_indices = jax.lax.top_k(weights, n_important)
         top_indices = jnp.sort(top_indices, axis=-1)
 
@@ -199,9 +194,8 @@ class TensoRF(eqx.Module):
         z_vals_imp = z_vals[batch_indices, top_indices]
         pts_imp = pts[batch_indices, top_indices, :]
         sigma_imp = sigma[batch_indices, top_indices]
-        dists_imp = dists[batch_indices, top_indices]  # True step distances
+        dists_imp = dists[batch_indices, top_indices]
 
-        # 6. Appearance-Only Pass
         pts_imp_flat = pts_imp.reshape(-1, 3)
         pts_imp_norm = self.normalize_coordinates(pts_imp_flat)
         pts_imp_norm = jnp.clip(pts_imp_norm, 0.0, 1.0)
@@ -226,7 +220,6 @@ class TensoRF(eqx.Module):
         rgb_imp = jax.nn.sigmoid(rgb_flat)
         rgb_imp = rgb_imp.reshape(rays_o.shape[0], n_important, 3)
 
-        # 7. Render using pre-computed true step distances
         return compute_volumetric_rendering(
             rgb_imp, sigma_imp, dists_imp, z_vals_imp, bg_color
         )
