@@ -8,10 +8,10 @@ from tqdm import tqdm
 from functools import partial
 
 
-def evaluate_test_psnr(params, static, test_dataset, key=None):
+def evaluate_test_psnr(params, static_arrays, static, test_dataset, key=None):
     print("\n--- Running Test Set Evaluation ---")
 
-    model_infer = eqx.combine(params, static)
+    model_infer = eqx.combine(params, static_arrays, static)
 
     @jax.jit
     def render_chunk(rays_o_chunk, rays_d_chunk):

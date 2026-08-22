@@ -28,12 +28,29 @@ def restore_step_count(new_opt_state, old_opt_state):
 @partial(
     jax.pmap,
     axis_name="devices",
-    in_axes=(0, 0, None, 0, None, None, None, None, None, None, None, None, None, None),
-    static_broadcasted_argnums=(2, 7, 8, 9, 10, 12, 13),
+    in_axes=(
+        0,
+        0,
+        None,
+        None,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ),
+    static_broadcasted_argnums=(3, 8, 9, 10, 11, 13, 14),
 )
 def pmap_train_block(
     params,
     opt_state,
+    static_arrays,
     static,
     rng,
     imgs,
@@ -63,7 +80,7 @@ def pmap_train_block(
             batch_size_per_device,
         )
 
-        model_local = eqx.combine(p, static)
+        model_local = eqx.combine(p, static_arrays, static)
 
         def loss_func(m):
             return loss_fn(

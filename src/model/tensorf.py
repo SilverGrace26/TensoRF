@@ -2,9 +2,14 @@ import jax
 import jax.numpy as jnp
 import jax.scipy
 import equinox as eqx
+import numpy as np
 from typing import Tuple
 
-from geometry.rays import sample_along_rays, encode_view_directions
+from geometry.rays import (
+    sample_along_rays,
+    encode_view_directions,
+    compute_ray_aabb_intersections,
+)
 from geometry.rendering import compute_volumetric_rendering
 
 
@@ -13,6 +18,7 @@ class TensoRF(eqx.Module):
     compute_dtype: jnp.dtype = eqx.field(static=True)
     bbox_min: jax.Array
     bbox_max: jax.Array
+    alpha_mask: jax.Array
     den_planes: Tuple[jax.Array, ...]
     den_lines: Tuple[jax.Array, ...]
     app_planes: Tuple[jax.Array, ...]
@@ -33,6 +39,9 @@ class TensoRF(eqx.Module):
         self.bbox_min = jnp.array([bbox_min] * 3)
         self.bbox_max = jnp.array([bbox_max] * 3)
         self.grid_dim = grid_dim
+
+        # Initialize an active occupancy grid to shape (128, 128, 128)
+        self.alpha_mask = jnp.ones((128, 128, 128), dtype=jnp.bool_)
 
         backend = jax.default_backend()
         self.compute_dtype = jnp.bfloat16 if backend == "tpu" else jnp.float16
@@ -128,9 +137,7 @@ class TensoRF(eqx.Module):
         plane_yz = bilinear_interp(planes[2], y, z)
         line_x = linear_interp(lines[2], x)
 
-        results = [plane_xy * line_z, plane_xz * line_y, plane_yz * line_x]
-
-        return results
+        return [plane_xy * line_z, plane_xz * line_y, plane_yz * line_x]
 
     def get_sigma_feat(self, xyz_normed):
         den_planes = tuple(x.astype(self.compute_dtype) for x in self.den_planes)
@@ -152,18 +159,35 @@ class TensoRF(eqx.Module):
 
     def __call__(self, rays_o, rays_d, key, bg_color):
         n_samples = 192
-        n_important = 48
 
         den_planes = tuple(x.astype(self.compute_dtype) for x in self.den_planes)
         den_lines = tuple(x.astype(self.compute_dtype) for x in self.den_lines)
         app_planes = tuple(x.astype(self.compute_dtype) for x in self.app_planes)
         app_lines = tuple(x.astype(self.compute_dtype) for x in self.app_lines)
 
-        pts, z_vals = sample_along_rays(rays_o, rays_d, n_samples, key)
+        near, far, hit_mask = compute_ray_aabb_intersections(
+            rays_o, rays_d, self.bbox_min, self.bbox_max
+        )
+        far = jnp.maximum(
+            far, near + 1e-5
+        )  # Ensure continuous sample distributions internally
+
+        pts, z_vals = sample_along_rays(rays_o, rays_d, near, far, n_samples, key)
 
         pts_flat = pts.reshape(-1, 3)
         pts_norm = self.normalize_coordinates(pts_flat)
-        mask = jax.lax.stop_gradient(((pts_norm > 0.0) & (pts_norm < 1.0)).all(axis=-1))
+        valid_mask = jax.lax.stop_gradient(
+            ((pts_norm >= 0.0) & (pts_norm <= 1.0)).all(axis=-1)
+        )
+
+        # Check coordinates against the alpha/occupancy mask
+        alpha_res = self.alpha_mask.shape[0]
+        grid_idx = jnp.clip(
+            jnp.floor(pts_norm * alpha_res).astype(jnp.int32), 0, alpha_res - 1
+        )
+        in_alpha = self.alpha_mask[grid_idx[:, 0], grid_idx[:, 1], grid_idx[:, 2]]
+
+        mask = valid_mask & in_alpha
         pts_norm = jnp.clip(pts_norm, 0.0, 1.0)
 
         den_components = self.interpolate_tensor_components(
@@ -172,7 +196,8 @@ class TensoRF(eqx.Module):
         sigma = sum(jnp.sum(comp, axis=0) for comp in den_components)
         sigma = jax.nn.softplus(sigma) * 5.0
 
-        sigma = sigma * mask
+        # Enforce physical constraints: Sigma defaults to 0 where mask fails
+        sigma = jnp.where(mask, sigma, 0.0)
         sigma = sigma.reshape(rays_o.shape[0], n_samples)
 
         dists = z_vals[..., 1:] - z_vals[..., :-1]
@@ -181,27 +206,9 @@ class TensoRF(eqx.Module):
         )
         dists = dists * jnp.linalg.norm(rays_d[..., None, :], axis=-1)
 
-        alpha = 1.0 - jnp.exp(-sigma * dists)
-        transmittance = jnp.cumprod(1.0 - alpha + 1e-10, axis=-1)
-        weights = alpha * jnp.concatenate(
-            [jnp.ones((alpha.shape[0], 1)), transmittance[..., :-1]], -1
-        )
-
-        _, top_indices = jax.lax.top_k(weights, n_important)
-        top_indices = jnp.sort(top_indices, axis=-1)
-
-        batch_indices = jnp.arange(rays_o.shape[0])[:, None]
-        z_vals_imp = z_vals[batch_indices, top_indices]
-        pts_imp = pts[batch_indices, top_indices, :]
-        sigma_imp = sigma[batch_indices, top_indices]
-        dists_imp = dists[batch_indices, top_indices]
-
-        pts_imp_flat = pts_imp.reshape(-1, 3)
-        pts_imp_norm = self.normalize_coordinates(pts_imp_flat)
-        pts_imp_norm = jnp.clip(pts_imp_norm, 0.0, 1.0)
-
+        # Replacing top-K selection entirely. Evaluate appearance over ALL valid samples in the continuous ray.
         app_components = self.interpolate_tensor_components(
-            pts_imp_norm, app_planes, app_lines
+            pts_norm, app_planes, app_lines
         )
         app_feats = jnp.concatenate(app_components, axis=0).T
 
@@ -209,7 +216,7 @@ class TensoRF(eqx.Module):
         app_feats_proj = app_feats @ basis
 
         view_dirs = rays_d / jnp.linalg.norm(rays_d, axis=-1, keepdims=True)
-        dirs_flat = view_dirs[:, None, :].repeat(n_important, axis=1).reshape(-1, 3)
+        dirs_flat = view_dirs[:, None, :].repeat(n_samples, axis=1).reshape(-1, 3)
         dirs_enc = encode_view_directions(dirs_flat)
         dirs_enc = dirs_enc.astype(self.compute_dtype)
 
@@ -217,12 +224,112 @@ class TensoRF(eqx.Module):
         rgb_flat_cast = jax.vmap(self.mlp_render)(mlp_input)
 
         rgb_flat = rgb_flat_cast.astype(jnp.float32)
-        rgb_imp = jax.nn.sigmoid(rgb_flat)
-        rgb_imp = rgb_imp.reshape(rays_o.shape[0], n_important, 3)
+        rgb_full = jax.nn.sigmoid(rgb_flat)
+        rgb_full = rgb_full.reshape(rays_o.shape[0], n_samples, 3)
 
-        return compute_volumetric_rendering(
-            rgb_imp, sigma_imp, dists_imp, z_vals_imp, bg_color
-        )
+        return compute_volumetric_rendering(rgb_full, sigma, dists, z_vals, bg_color)
+
+
+def update_alpha_mask(model):
+    res = model.alpha_mask.shape[0]
+    x = jnp.linspace(0, 1, res)
+    X, Y, Z = jnp.meshgrid(x, x, x, indexing="ij")
+    pts_norm = jnp.stack([X, Y, Z], axis=-1).reshape(-1, 3)
+
+    @jax.jit
+    def get_sigma(pts):
+        sigma, _ = model.get_sigma_feat(pts)
+        return sigma
+
+    sigmas = []
+    chunk = res * res
+    for i in range(0, pts_norm.shape[0], chunk):
+        pts_chunk = pts_norm[i : i + chunk]
+        sigmas.append(np.array(get_sigma(pts_chunk)))
+
+    sigma_grid = np.concatenate(sigmas, axis=0)
+
+    extent = np.linalg.norm(np.array(model.bbox_max) - np.array(model.bbox_min))
+    step_size = extent / 192.0
+
+    alpha = 1.0 - np.exp(-sigma_grid * step_size)
+    mask_flat = alpha > 0.0001
+    mask = mask_flat.reshape(res, res, res)
+
+    new_mask = jax.device_put(jnp.array(mask))
+    return eqx.tree_at(lambda m: m.alpha_mask, model, new_mask)
+
+
+def shrink_bbox(model):
+    mask = np.array(model.alpha_mask)
+    if not np.any(mask):
+        return model
+
+    indices = np.where(mask)
+    min_idx = np.array([np.min(indices[0]), np.min(indices[1]), np.min(indices[2])])
+    max_idx = np.array([np.max(indices[0]), np.max(indices[1]), np.max(indices[2])])
+
+    res = mask.shape[0]
+    max_idx = np.maximum(max_idx, min_idx + 1)
+
+    min_norm = min_idx / (res - 1.0)
+    max_norm = max_idx / (res - 1.0)
+
+    old_min = np.array(model.bbox_min)
+    old_max = np.array(model.bbox_max)
+    extent = old_max - old_min
+
+    new_bbox_min = old_min + min_norm * extent
+    new_bbox_max = old_min + max_norm * extent
+
+    voxel_size = (new_bbox_max - new_bbox_min) / res
+    new_bbox_min -= voxel_size
+    new_bbox_max += voxel_size
+
+    # Calculate crop indices against current grid resolution
+    grid_dim = model.grid_dim
+    ix0, iy0, iz0 = np.floor(min_norm * (grid_dim - 1)).astype(int)
+    ix1, iy1, iz1 = np.ceil(max_norm * (grid_dim - 1)).astype(int) + 1
+
+    ix0, iy0, iz0 = max(0, ix0), max(0, iy0), max(0, iz0)
+    ix1, iy1, iz1 = min(grid_dim, ix1), min(grid_dim, iy1), min(grid_dim, iz1)
+
+    # Guarantee at least a minimal volumetric width
+    ix1 = max(ix1, ix0 + 1)
+    iy1 = max(iy1, iy0 + 1)
+    iz1 = max(iz1, iz0 + 1)
+
+    # Map spatial slice axes accurately to Tensor representation planes
+    def crop_planes(planes):
+        p_xy = planes[0][:, iy0:iy1, ix0:ix1]
+        p_xz = planes[1][:, iz0:iz1, ix0:ix1]
+        p_yz = planes[2][:, iz0:iz1, iy0:iy1]
+        return (jnp.array(p_xy), jnp.array(p_xz), jnp.array(p_yz))
+
+    def crop_lines(lines):
+        l_z = lines[0][:, iz0:iz1, :]
+        l_y = lines[1][:, iy0:iy1, :]
+        l_x = lines[2][:, ix0:ix1, :]
+        return (jnp.array(l_z), jnp.array(l_y), jnp.array(l_x))
+
+    new_den_planes = crop_planes([np.array(p) for p in model.den_planes])
+    new_den_lines = crop_lines([np.array(l) for l in model.den_lines])
+    new_app_planes = crop_planes([np.array(p) for p in model.app_planes])
+    new_app_lines = crop_lines([np.array(l) for l in model.app_lines])
+
+    model = eqx.tree_at(
+        lambda m: m.bbox_min, model, jax.device_put(jnp.array(new_bbox_min))
+    )
+    model = eqx.tree_at(
+        lambda m: m.bbox_max, model, jax.device_put(jnp.array(new_bbox_max))
+    )
+
+    model = eqx.tree_at(
+        lambda m: [m.den_planes, m.den_lines, m.app_planes, m.app_lines],
+        model,
+        [new_den_planes, new_den_lines, new_app_planes, new_app_lines],
+    )
+    return model
 
 
 def upsample_tensoRF(old_model, new_grid_dim, key):
@@ -235,6 +342,7 @@ def upsample_tensoRF(old_model, new_grid_dim, key):
                 target_shape = (old_c.shape[0], new_res, 1)
             else:
                 target_shape = (old_c.shape[0], new_res, new_res)
+            # jax.image.resize will correctly scale cropped, disproportionate matrices to match new_res natively.
             new_c = jax.image.resize(old_c, target_shape, method="linear")
             new_comps.append(new_c)
         return tuple(new_comps)
@@ -256,6 +364,9 @@ def upsample_tensoRF(old_model, new_grid_dim, key):
             m.app_lines,
             m.mlp_render,
             m.basis_mat,
+            m.bbox_min,
+            m.bbox_max,
+            m.alpha_mask,
         ],
         new_model,
         [
@@ -265,6 +376,9 @@ def upsample_tensoRF(old_model, new_grid_dim, key):
             new_app_lines,
             old_model.mlp_render,
             old_model.basis_mat,
+            old_model.bbox_min,
+            old_model.bbox_max,
+            old_model.alpha_mask,
         ],
     )
     return new_model

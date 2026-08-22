@@ -29,10 +29,32 @@ def sample_batch_on_device(
     return rays_o, rays_d, gt_rgb
 
 
-def sample_along_rays(rays_o, rays_d, n_samples, key=None):
-    near, far = 0.2, 6.0
-    z_vals = jnp.linspace(near, far, n_samples)
-    z_vals = jnp.broadcast_to(z_vals, (rays_o.shape[0], n_samples))
+def compute_ray_aabb_intersections(rays_o, rays_d, bbox_min, bbox_max):
+    # Safely invert ray direction to avoid divide by zero errors
+    inv_d = jnp.where(jnp.abs(rays_d) < 1e-6, 1e-6 * jnp.sign(rays_d + 1e-9), rays_d)
+    inv_d = 1.0 / inv_d
+
+    t0 = (bbox_min - rays_o) * inv_d
+    t1 = (bbox_max - rays_o) * inv_d
+
+    t_min = jnp.minimum(t0, t1)
+    t_max = jnp.maximum(t0, t1)
+
+    near = jnp.max(t_min, axis=-1)
+    far = jnp.min(t_max, axis=-1)
+
+    hit_mask = (near < far) & (far > 0)
+    near = jnp.maximum(near, 0.0)
+    return near, far, hit_mask
+
+
+def sample_along_rays(rays_o, rays_d, near, far, n_samples, key=None):
+    t_vals = jnp.linspace(0.0, 1.0, n_samples)
+
+    # Broadcast limits appropriately
+    near = near[..., None]
+    far = far[..., None]
+    z_vals = near + (far - near) * t_vals
 
     if key is not None:
         mids = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])
@@ -41,7 +63,7 @@ def sample_along_rays(rays_o, rays_d, n_samples, key=None):
         t_rand = jax.random.uniform(key, z_vals.shape)
         z_vals = lower + (upper - lower) * t_rand
 
-    pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., :, None]
+    pts = rays_o[..., None, :] + rays_d[..., None, :] * z_vals[..., None]
     return pts, z_vals
 
 

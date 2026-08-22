@@ -18,7 +18,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from core.dataset import DataLoader
 from core.losses import loss_fn
 from core.engine import pmap_train_block, restore_step_count
-from model.tensorf import TensoRF, upsample_tensoRF
+from model.tensorf import TensoRF, upsample_tensoRF, update_alpha_mask, shrink_bbox
 from visualization import evaluate_test_psnr
 
 
@@ -37,6 +37,12 @@ def device_put_replicated(tree, devices):
         ),
         tree,
     )
+
+
+def partition_model(model):
+    params, rest = eqx.partition(model, eqx.is_inexact_array)
+    static_arrays, static = eqx.partition(rest, eqx.is_array)
+    return params, static_arrays, static
 
 
 def main(args):
@@ -70,42 +76,6 @@ def main(args):
         dataset = DataLoader(base_dir=args.data_dir, split="train", half_res=False)
         test_dataset = DataLoader(base_dir=args.data_dir, split="test", half_res=False)
 
-        if args.verbose:
-            print("\n" + "-" * 60)
-            print("🔍 VERBOSE DIAGNOSTICS: Coordinate & Pipeline Audit")
-
-            train_centers = dataset.poses[:, :3, 3]
-            test_centers = test_dataset.poses[:, :3, 3]
-
-            train_up = dataset.poses[:, :3, 1].mean(axis=0)
-            train_forward = -dataset.poses[:, :3, 2].mean(axis=0)
-            test_up = test_dataset.poses[:, :3, 1].mean(axis=0)
-
-            print(f"Train Camera Bounding Box:")
-            print(f"  Min: {train_centers.min(axis=0).round(3)}")
-            print(f"  Max: {train_centers.max(axis=0).round(3)}")
-            print(f"Test Camera Bounding Box:")
-            print(f"  Min: {test_centers.min(axis=0).round(3)}")
-            print(f"  Max: {test_centers.max(axis=0).round(3)}")
-
-            print(f"\nAverage Camera Directions:")
-            print(f"  Train 'Up' Vector      : {train_up.round(3)}")
-            print(f"  Train 'Forward' Vector : {train_forward.round(3)}")
-
-            up_dot_product = np.dot(train_up, test_up)
-            print(
-                f"\nTrain/Test Up-Vector Alignment: {up_dot_product:.3f} (Should be ~1.0)"
-            )
-            if up_dot_product < 0.9:
-                print(
-                    "  ⚠️ WARNING: Train and Test cameras might be using different coordinate systems!"
-                )
-
-            print(f"\nImage Channels:")
-            print(f"  Train shape: {dataset.imgs.shape}")
-            print(f"  Test shape:  {test_dataset.imgs.shape}")
-            print("-" * 60 + "\n")
-
         os.makedirs(args.ckpt_dir, exist_ok=True)
         ckpt_prefix = os.path.join(args.ckpt_dir, "tensorf_ckpt")
 
@@ -125,18 +95,46 @@ def main(args):
         key = jax.random.PRNGKey(42)
         model_key, train_key = jax.random.split(key)
 
-        lr_schedule = optax.warmup_cosine_decay_schedule(
-            init_value=1e-4,
+        current_step = 0
+
+        lr_schedule_grids = optax.warmup_cosine_decay_schedule(
+            init_value=2e-3,
             peak_value=2e-2,
-            warmup_steps=2000,
+            warmup_steps=1000,
             decay_steps=args.n_iters,
-            end_value=1e-3,
+            end_value=2e-3,
         )
-        optimizer = optax.chain(
-            optax.clip_by_global_norm(1.0), optax.adam(lr_schedule, b1=0.9, b2=0.99)
+        lr_schedule_mlp = optax.warmup_cosine_decay_schedule(
+            init_value=1e-4,
+            peak_value=1e-3,
+            warmup_steps=1000,
+            decay_steps=args.n_iters,
+            end_value=1e-4,
         )
 
-        current_step = 0
+        optim_grids = optax.adam(lr_schedule_grids, b1=0.9, b2=0.99)
+        optim_mlp = optax.adam(lr_schedule_mlp, b1=0.9, b2=0.99)
+
+        def label_fn(tree):
+            labels = jax.tree_util.tree_map(lambda _: "grid", tree)
+            if hasattr(tree, "mlp_render") and tree.mlp_render is not None:
+                labels = eqx.tree_at(
+                    lambda m: m.mlp_render,
+                    labels,
+                    jax.tree_util.tree_map(lambda _: "mlp", tree.mlp_render),
+                )
+            if hasattr(tree, "basis_mat") and tree.basis_mat is not None:
+                labels = eqx.tree_at(
+                    lambda m: m.basis_mat,
+                    labels,
+                    jax.tree_util.tree_map(lambda _: "mlp", tree.basis_mat),
+                )
+            return labels
+
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.multi_transform({"grid": optim_grids, "mlp": optim_mlp}, label_fn),
+        )
 
         if (
             os.path.exists(ckpt_prefix + "_meta.json")
@@ -156,19 +154,13 @@ def main(args):
                 n_comp_den=n_comp_den,
                 n_comp_app=n_comp_app,
             )
-            model = eqx.tree_at(
-                lambda m: m.mlp_render,
-                model,
-                jax.tree_util.tree_map(
-                    lambda x: x * 0.1 if eqx.is_array(x) else x, model.mlp_render
-                ),
-            )
-            params, static = eqx.partition(model, eqx.is_array)
-            opt_state = optimizer.init(params)
 
-            model = eqx.combine(params, static)
+            params, static_arrays, static = partition_model(model)
+            model = eqx.combine(params, static_arrays, static)
             model = eqx.tree_deserialise_leaves(ckpt_prefix + "_model.eqx", model)
-            params, static = eqx.partition(model, eqx.is_array)
+            params, static_arrays, static = partition_model(model)
+
+            opt_state = optimizer.init(params)
             opt_state = eqx.tree_deserialise_leaves(ckpt_prefix + "_opt.eqx", opt_state)
             print(
                 f"Resumed successfully at Step {current_step} | Grid Size {initial_grid_dim}."
@@ -181,48 +173,10 @@ def main(args):
                 n_comp_den=n_comp_den,
                 n_comp_app=n_comp_app,
             )
-            model = eqx.tree_at(
-                lambda m: m.mlp_render,
-                model,
-                jax.tree_util.tree_map(
-                    lambda x: x * 0.1 if eqx.is_array(x) else x, model.mlp_render
-                ),
-            )
-            params, static = eqx.partition(model, eqx.is_array)
+            params, static_arrays, static = partition_model(model)
             opt_state = optimizer.init(params)
 
-        print("\n--- XLA Cost Analysis for a Single Step ---")
-        mock_rays_o = jnp.zeros((BATCH_SIZE_PER_DEVICE, 3))
-        mock_rays_d = jnp.zeros((BATCH_SIZE_PER_DEVICE, 3))
-        mock_rgb = jnp.zeros((BATCH_SIZE_PER_DEVICE, 3))
-        mock_key = jax.random.PRNGKey(0)
-
-        @jax.jit
-        def test_forward_backward(p):
-            m_bench = eqx.combine(p, static)
-            return eqx.filter_value_and_grad(loss_fn, has_aux=True)(
-                m_bench,
-                mock_rays_o,
-                mock_rays_d,
-                mock_rgb,
-                mock_key,
-                0.5,
-                4e-5,
-                jnp.array([1.0, 1.0, 1.0]),
-            )
-
-        lowered = test_forward_backward.lower(params)
-        compiled = lowered.compile()
-
-        try:
-            costs = compiled.cost_analysis()
-            for key_cost, val_cost in costs.items():
-                print(f"{key_cost}: {val_cost}")
-        except Exception as e:
-            print(f"Cost analysis not available for this backend: {e}")
-        print("-------------------------------------------\n")
-
-        print("Replicating parameters across hardware devices...")
+        print("\nReplicating parameters across hardware devices...")
         H, W = dataset.H, dataset.W
         imgs_jax = jnp.array(dataset.imgs)
         rays_o_jax = jnp.array(dataset.rays_o)
@@ -257,6 +211,7 @@ def main(args):
             params_rep, opt_state_rep, device_keys, losses, mses = pmap_train_block(
                 params_rep,
                 opt_state_rep,
+                static_arrays,
                 static,
                 device_keys,
                 imgs_jax,
@@ -298,10 +253,22 @@ def main(args):
                 )
 
                 params_single = jax.tree_util.tree_map(lambda x: x[0], params_rep)
-                model = eqx.combine(params_single, static)
+                model = eqx.combine(params_single, static_arrays, static)
+
+                print("Evaluating Occupancy Grid and Shrinking Bounding Box...")
+                model = update_alpha_mask(model)
+                model = shrink_bbox(model)
+
+                model = eqx.tree_at(
+                    lambda m: m.alpha_mask,
+                    model,
+                    jax.device_put(jnp.ones_like(model.alpha_mask)),
+                )
 
                 model = upsample_tensoRF(model, new_dim, train_key)
-                params, static = eqx.partition(model, eqx.is_array)
+                params, static_arrays, static = partition_model(model)
+                model = upsample_tensoRF(model, new_dim, train_key)
+                params, static_arrays, static = partition_model(model)
 
                 new_opt_state = optimizer.init(params)
                 old_state_single = jax.tree_util.tree_map(lambda x: x[0], opt_state_rep)
@@ -315,7 +282,7 @@ def main(args):
             params_single = jax.tree_util.tree_map(lambda x: x[0], params_rep)
             opt_state_single = jax.tree_util.tree_map(lambda x: x[0], opt_state_rep)
 
-            model_to_save = eqx.combine(params_single, static)
+            model_to_save = eqx.combine(params_single, static_arrays, static)
             eqx.tree_serialise_leaves(ckpt_prefix + "_model.eqx", model_to_save)
             eqx.tree_serialise_leaves(ckpt_prefix + "_opt.eqx", opt_state_single)
 
@@ -337,7 +304,9 @@ def main(args):
         print("============================================================")
 
         params_final = jax.tree_util.tree_map(lambda x: x[0], params_rep)
-        test_psnr = evaluate_test_psnr(params_final, static, test_dataset)
+        test_psnr = evaluate_test_psnr(
+            params_final, static_arrays, static, test_dataset
+        )
 
         mlflow.log_metric("test_psnr", test_psnr, step=args.n_iters)
 
