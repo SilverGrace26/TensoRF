@@ -30,6 +30,10 @@ def sample_batch_on_device(
 
 
 def compute_ray_aabb_intersections(rays_o, rays_d, bbox_min, bbox_max):
+    # Stop gradient propagation so the optimizer cannot drift the bounding box
+    bbox_min = jax.lax.stop_gradient(bbox_min)
+    bbox_max = jax.lax.stop_gradient(bbox_max)
+
     # Safely invert ray direction to avoid divide by zero errors
     inv_d = jnp.where(jnp.abs(rays_d) < 1e-6, 1e-6 * jnp.sign(rays_d + 1e-9), rays_d)
     inv_d = 1.0 / inv_d

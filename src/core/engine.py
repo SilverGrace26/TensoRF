@@ -44,8 +44,9 @@ def restore_step_count(new_opt_state, old_opt_state):
         None,
         None,
         None,
+        None,
     ),
-    static_broadcasted_argnums=(3, 8, 9, 10, 11, 13, 14),
+    static_broadcasted_argnums=(3, 8, 9, 11, 13, 14, 15),
 )
 def pmap_train_block(
     params,
@@ -58,16 +59,19 @@ def pmap_train_block(
     rays_d_all,
     H,
     W,
+    start_step,
     num_steps,
-    is_precrop,
     tv_weight,
     optimizer,
     batch_size_per_device,
+    verbose,
 ):
-
     def step_fn(carry, step_idx):
         p, opt, current_rng = carry
         current_rng, sample_key, model_key = jax.random.split(current_rng, 3)
+
+        global_step = start_step + step_idx
+        is_precrop = global_step < 1000
 
         rays_o, rays_d, target_rgb = sample_batch_on_device(
             sample_key,
@@ -98,11 +102,24 @@ def pmap_train_block(
             model_local
         )
 
-        if hasattr(grads, "mlp_render"):
-            scaled_mlp = jax.tree_util.tree_map(
-                lambda x: x * 0.1 if eqx.is_array(x) else x, grads.mlp_render
+        # --- CONDITIONALLY COMPILED TELEMETRY ---
+        if verbose:
+            max_den_grad = jnp.max(jnp.abs(grads.den_planes[0]))
+            max_app_grad = jnp.max(jnp.abs(grads.app_planes[0]))
+            reg_loss = loss - mse
+            has_nan = jnp.isnan(loss)
+
+            jax.debug.print(
+                "Step {} | MSE: {:.4f} | Reg: {:.4f} | DenGrad: {:.2e} | AppGrad: {:.2e} | BBox Min: {} | NaN: {}",
+                global_step,
+                mse,
+                reg_loss,
+                max_den_grad,
+                max_app_grad,
+                p.bbox_min,
+                has_nan,
             )
-            grads = eqx.tree_at(lambda t: t.mlp_render, grads, scaled_mlp)
+        # ----------------------------------------
 
         grads = jax.lax.pmean(grads, axis_name="devices")
         updates, new_opt = optimizer.update(grads, opt, p)

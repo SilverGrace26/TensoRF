@@ -40,7 +40,6 @@ class TensoRF(eqx.Module):
         self.bbox_max = jnp.array([bbox_max] * 3)
         self.grid_dim = grid_dim
 
-        # Initialize an active occupancy grid to shape (128, 128, 128)
         self.alpha_mask = jnp.ones((128, 128, 128), dtype=jnp.bool_)
 
         backend = jax.default_backend()
@@ -140,16 +139,19 @@ class TensoRF(eqx.Module):
         return [plane_xy * line_z, plane_xz * line_y, plane_yz * line_x]
 
     def get_sigma_feat(self, xyz_normed):
-        den_planes = tuple(x.astype(self.compute_dtype) for x in self.den_planes)
-        den_lines = tuple(x.astype(self.compute_dtype) for x in self.den_lines)
-        app_planes = tuple(x.astype(self.compute_dtype) for x in self.app_planes)
-        app_lines = tuple(x.astype(self.compute_dtype) for x in self.app_lines)
+        # Let the grids remain in their native FP32 precision to safely accumulate tiny gradients
+        den_planes = self.den_planes
+        den_lines = self.den_lines
+        app_planes = self.app_planes
+        app_lines = self.app_lines
 
         den_components = self.interpolate_tensor_components(
             xyz_normed, den_planes, den_lines
         )
         sigma = sum(jnp.sum(comp, axis=0) for comp in den_components)
-        sigma = jax.nn.softplus(sigma) * 5.0
+
+        # [FIX]: Use standard softplus without the extreme -10.0 bottleneck
+        sigma = jax.nn.softplus(sigma)
 
         app_components = self.interpolate_tensor_components(
             xyz_normed, app_planes, app_lines
@@ -160,17 +162,16 @@ class TensoRF(eqx.Module):
     def __call__(self, rays_o, rays_d, key, bg_color):
         n_samples = 192
 
-        den_planes = tuple(x.astype(self.compute_dtype) for x in self.den_planes)
-        den_lines = tuple(x.astype(self.compute_dtype) for x in self.den_lines)
-        app_planes = tuple(x.astype(self.compute_dtype) for x in self.app_planes)
-        app_lines = tuple(x.astype(self.compute_dtype) for x in self.app_lines)
+        # Let the grids remain in their native FP32 precision to safely accumulate tiny gradients
+        den_planes = self.den_planes
+        den_lines = self.den_lines
+        app_planes = self.app_planes
+        app_lines = self.app_lines
 
         near, far, hit_mask = compute_ray_aabb_intersections(
             rays_o, rays_d, self.bbox_min, self.bbox_max
         )
-        far = jnp.maximum(
-            far, near + 1e-5
-        )  # Ensure continuous sample distributions internally
+        far = jnp.maximum(far, near + 1e-5)
 
         pts, z_vals = sample_along_rays(rays_o, rays_d, near, far, n_samples, key)
 
@@ -180,7 +181,6 @@ class TensoRF(eqx.Module):
             ((pts_norm >= 0.0) & (pts_norm <= 1.0)).all(axis=-1)
         )
 
-        # Check coordinates against the alpha/occupancy mask
         alpha_res = self.alpha_mask.shape[0]
         grid_idx = jnp.clip(
             jnp.floor(pts_norm * alpha_res).astype(jnp.int32), 0, alpha_res - 1
@@ -194,9 +194,10 @@ class TensoRF(eqx.Module):
             pts_norm, den_planes, den_lines
         )
         sigma = sum(jnp.sum(comp, axis=0) for comp in den_components)
-        sigma = jax.nn.softplus(sigma) * 5.0
 
-        # Enforce physical constraints: Sigma defaults to 0 where mask fails
+        # [FIX]: Use standard softplus without the extreme -10.0 bottleneck
+        sigma = jax.nn.softplus(sigma)
+
         sigma = jnp.where(mask, sigma, 0.0)
         sigma = sigma.reshape(rays_o.shape[0], n_samples)
 
@@ -206,12 +207,12 @@ class TensoRF(eqx.Module):
         )
         dists = dists * jnp.linalg.norm(rays_d[..., None, :], axis=-1)
 
-        # Replacing top-K selection entirely. Evaluate appearance over ALL valid samples in the continuous ray.
         app_components = self.interpolate_tensor_components(
             pts_norm, app_planes, app_lines
         )
         app_feats = jnp.concatenate(app_components, axis=0).T
 
+        # Keep the compute_dtype cast for the MLP inputs, as these gradients easily survive float16
         basis = self.basis_mat.astype(self.compute_dtype)
         app_feats_proj = app_feats @ basis
 
@@ -286,7 +287,6 @@ def shrink_bbox(model):
     new_bbox_min -= voxel_size
     new_bbox_max += voxel_size
 
-    # Calculate crop indices against current grid resolution
     grid_dim = model.grid_dim
     ix0, iy0, iz0 = np.floor(min_norm * (grid_dim - 1)).astype(int)
     ix1, iy1, iz1 = np.ceil(max_norm * (grid_dim - 1)).astype(int) + 1
@@ -294,12 +294,10 @@ def shrink_bbox(model):
     ix0, iy0, iz0 = max(0, ix0), max(0, iy0), max(0, iz0)
     ix1, iy1, iz1 = min(grid_dim, ix1), min(grid_dim, iy1), min(grid_dim, iz1)
 
-    # Guarantee at least a minimal volumetric width
     ix1 = max(ix1, ix0 + 1)
     iy1 = max(iy1, iy0 + 1)
     iz1 = max(iz1, iz0 + 1)
 
-    # Map spatial slice axes accurately to Tensor representation planes
     def crop_planes(planes):
         p_xy = planes[0][:, iy0:iy1, ix0:ix1]
         p_xz = planes[1][:, iz0:iz1, ix0:ix1]
@@ -342,7 +340,6 @@ def upsample_tensoRF(old_model, new_grid_dim, key):
                 target_shape = (old_c.shape[0], new_res, 1)
             else:
                 target_shape = (old_c.shape[0], new_res, new_res)
-            # jax.image.resize will correctly scale cropped, disproportionate matrices to match new_res natively.
             new_c = jax.image.resize(old_c, target_shape, method="linear")
             new_comps.append(new_c)
         return tuple(new_comps)

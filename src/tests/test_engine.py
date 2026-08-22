@@ -1,3 +1,4 @@
+# tests/test_engine.py
 import pytest
 import numpy as np
 import jax
@@ -38,7 +39,6 @@ def test_pmap_train_block_execution():
 
     model = TensoRF(model_key, grid_dim=16)
 
-    # 3-Way Partition for Inexact Arrays, Exact Arrays, and Pure Static
     params, rest = eqx.partition(model, eqx.is_inexact_array)
     static_arrays, static = eqx.partition(rest, eqx.is_array)
 
@@ -74,11 +74,12 @@ def test_pmap_train_block_execution():
         rays_d,
         H,
         W,
+        0,
         num_steps,
-        True,
         0.1,
         optimizer,
         batch_size_per_device,
+        False,
     )
 
     assert new_params is not None

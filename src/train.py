@@ -12,6 +12,7 @@ import equinox as eqx
 import optax
 import mlflow
 import dagshub
+from tqdm import tqdm
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -45,6 +46,13 @@ def partition_model(model):
     return params, static_arrays, static
 
 
+def build_schedule(n_iters):
+    milestones = [2000, 3000, 4000, 5500, 7000]
+    filtered = [m for m in milestones if m < n_iters]
+    schedule = sorted(list(set(filtered + [n_iters])))
+    return schedule
+
+
 def main(args):
     backend = jax.default_backend()
     devices = jax.local_devices()
@@ -58,8 +66,11 @@ def main(args):
         )
     print("=" * 50 + "\n")
 
-    dagshub.init(repo_owner="silvergrace26", repo_name="TensoRF", mlflow=True)
-    mlflow.set_experiment("TensoRF_JAX_Training")
+    try:
+        dagshub.init(repo_owner="silvergrace26", repo_name="TensoRF", mlflow=True)
+        mlflow.set_experiment("TensoRF_JAX_Training")
+    except Exception as e:
+        print(f"Tracking initialization skipped/failed: {e}")
 
     with mlflow.start_run(
         run_name=f"TensoRF_grid{args.init_grid_dim}_iters{args.n_iters}"
@@ -79,36 +90,38 @@ def main(args):
         os.makedirs(args.ckpt_dir, exist_ok=True)
         ckpt_prefix = os.path.join(args.ckpt_dir, "tensorf_ckpt")
 
-        BATCH_SIZE_PER_DEVICE = args.global_batch_size // max(1, n_devices)
+        BATCH_SIZE_PER_DEVICE = max(1, args.global_batch_size // max(1, n_devices))
         print(
             f"Global Batch Size: {args.global_batch_size} | Per Device Chunk: {BATCH_SIZE_PER_DEVICE}"
         )
 
         initial_grid_dim = args.init_grid_dim
         res_map = {2000: 150, 3000: 200, 4000: 300, 5500: 400, 7000: 512}
-        schedule = [2000, 3000, 4000, 5500, 7000, args.n_iters]
+        schedule = build_schedule(args.n_iters)
 
         TV_START_WEIGHT = 0.5
         TV_END_WEIGHT = 0.01
-        PRECROP_ITERS = 1000
 
         key = jax.random.PRNGKey(42)
         model_key, train_key = jax.random.split(key)
 
         current_step = 0
 
+        warmup_steps = min(1000, max(1, args.n_iters // 2))
+        schedule_decay_steps = max(args.n_iters, warmup_steps + 1)
+
         lr_schedule_grids = optax.warmup_cosine_decay_schedule(
             init_value=2e-3,
             peak_value=2e-2,
-            warmup_steps=1000,
-            decay_steps=args.n_iters,
+            warmup_steps=warmup_steps,
+            decay_steps=schedule_decay_steps,
             end_value=2e-3,
         )
         lr_schedule_mlp = optax.warmup_cosine_decay_schedule(
             init_value=1e-4,
             peak_value=1e-3,
-            warmup_steps=1000,
-            decay_steps=args.n_iters,
+            warmup_steps=warmup_steps,
+            decay_steps=schedule_decay_steps,
             end_value=1e-4,
         )
 
@@ -186,49 +199,66 @@ def main(args):
         opt_state_rep = device_put_replicated(opt_state, devices)
 
         print("Starting optimized block loop...")
-        start_time = time.time()
 
         device_keys_list = list(jax.random.split(train_key, n_devices))
         device_keys = device_put_sharded(device_keys_list, devices)
 
-        for next_upsample in schedule:
-            steps_to_run = next_upsample - current_step
+        final_loss, final_mse, psnr = 0.0, 0.0, 0.0
 
-            if steps_to_run <= 0:
+        for next_upsample in schedule:
+            steps_in_block = next_upsample - current_step
+
+            if steps_in_block <= 0:
                 continue
 
-            is_precrop = current_step < PRECROP_ITERS
-            alpha = current_step / args.n_iters
+            alpha = current_step / max(1, args.n_iters)
             current_tv_weight = np.exp(
                 (1 - alpha) * np.log(TV_START_WEIGHT) + alpha * np.log(TV_END_WEIGHT)
             )
             actual_tv_lambda = current_tv_weight * 1e-4
 
-            print(
-                f"\nRunning block: steps {current_step} to {next_upsample} (Precrop: {is_precrop})..."
-            )
+            print(f"\nTargeting Step {next_upsample} (Upsample Bound)...")
+            start_time = time.time()
 
-            params_rep, opt_state_rep, device_keys, losses, mses = pmap_train_block(
-                params_rep,
-                opt_state_rep,
-                static_arrays,
-                static,
-                device_keys,
-                imgs_jax,
-                rays_o_jax,
-                rays_d_jax,
-                H,
-                W,
-                steps_to_run,
-                is_precrop,
-                actual_tv_lambda,
-                optimizer,
-                BATCH_SIZE_PER_DEVICE,
-            )
+            chunk_size = 100
+            with tqdm(total=steps_in_block, desc="Training") as pbar:
+                while current_step < next_upsample:
+                    run_steps = min(chunk_size, next_upsample - current_step)
+                    if run_steps <= 0:
+                        break
 
-            final_loss = losses[0][-1].item()
-            final_mse = mses[0][-1].item()
-            psnr = -10.0 * np.log10(final_mse)
+                    params_rep, opt_state_rep, device_keys, losses, mses = (
+                        pmap_train_block(
+                            params_rep,
+                            opt_state_rep,
+                            static_arrays,
+                            static,
+                            device_keys,
+                            imgs_jax,
+                            rays_o_jax,
+                            rays_d_jax,
+                            H,
+                            W,
+                            current_step,
+                            run_steps,
+                            actual_tv_lambda,
+                            optimizer,
+                            BATCH_SIZE_PER_DEVICE,
+                            args.verbose,
+                        )
+                    )
+
+                    current_step += run_steps
+
+                    if losses.shape[-1] > 0:
+                        final_loss = float(jnp.mean(losses[:, -1]))
+                        final_mse = float(jnp.mean(mses[:, -1]))
+                        psnr = -10.0 * np.log10(max(final_mse, 1e-10))
+
+                    pbar.set_postfix(
+                        {"Loss": f"{final_loss:.4f}", "PSNR": f"{psnr:.2f} dB"}
+                    )
+                    pbar.update(run_steps)
 
             print(
                 f"Reached Step {next_upsample} | Final Step Loss: {final_loss:.5f} | PSNR: {psnr:.2f} dB | Time: {time.time() - start_time:.1f}s"
@@ -242,9 +272,6 @@ def main(args):
                 },
                 step=next_upsample,
             )
-
-            start_time = time.time()
-            current_step = next_upsample
 
             if current_step in res_map:
                 new_dim = res_map[current_step]
@@ -265,8 +292,6 @@ def main(args):
                     jax.device_put(jnp.ones_like(model.alpha_mask)),
                 )
 
-                model = upsample_tensoRF(model, new_dim, train_key)
-                params, static_arrays, static = partition_model(model)
                 model = upsample_tensoRF(model, new_dim, train_key)
                 params, static_arrays, static = partition_model(model)
 
