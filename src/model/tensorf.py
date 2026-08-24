@@ -78,6 +78,8 @@ class TensoRF(eqx.Module):
         return jax.lax.stop_gradient((xyz - min_b) / (max_b - min_b))
 
     def interpolate_tensor_components(self, xyz_normed, planes, lines):
+        import jax.scipy.ndimage
+
         grid_dim = self.grid_dim
         scaled_coords = jax.lax.stop_gradient(xyz_normed * (grid_dim - 1))
 
@@ -86,46 +88,21 @@ class TensoRF(eqx.Module):
         z = scaled_coords[..., 2]
 
         def bilinear_interp(plane, coord_u, coord_v):
-            u0 = jnp.floor(coord_u).astype(jnp.int32)
-            v0 = jnp.floor(coord_v).astype(jnp.int32)
-            u1 = u0 + 1
-            v1 = v0 + 1
-
-            u0 = jnp.clip(u0, 0, grid_dim - 1)
-            v0 = jnp.clip(v0, 0, grid_dim - 1)
-            u1 = jnp.clip(u1, 0, grid_dim - 1)
-            v1 = jnp.clip(v1, 0, grid_dim - 1)
-
-            plane = jnp.moveaxis(plane, 0, -1)
-            c00 = plane[v0, u0]
-            c01 = plane[v0, u1]
-            c10 = plane[v1, u0]
-            c11 = plane[v1, u1]
-
-            wu = jnp.expand_dims(coord_u - u0, axis=-1)
-            wv = jnp.expand_dims(coord_v - v0, axis=-1)
-
-            c0 = c00 * (1 - wu) + c01 * wu
-            c1 = c10 * (1 - wu) + c11 * wu
-            c = c0 * (1 - wv) + c1 * wv
-
-            return jnp.moveaxis(c, -1, 0)
+            # plane shape: (C, grid_dim, grid_dim)
+            coords = jnp.stack([coord_v, coord_u], axis=0)
+            # Map coordinates across the channel dimension
+            interp_fn = lambda p: jax.scipy.ndimage.map_coordinates(
+                p, coords, order=1, mode="nearest"
+            )
+            return jax.vmap(interp_fn)(plane)
 
         def linear_interp(line, coord):
-            u0 = jnp.floor(coord).astype(jnp.int32)
-            u1 = u0 + 1
-
-            u0 = jnp.clip(u0, 0, grid_dim - 1)
-            u1 = jnp.clip(u1, 0, grid_dim - 1)
-
-            line = jnp.moveaxis(line, 0, -1)
-            c0 = line[u0, 0]
-            c1 = line[u1, 0]
-
-            wu = jnp.expand_dims(coord - u0, axis=-1)
-            c = c0 * (1 - wu) + c1 * wu
-
-            return jnp.moveaxis(c, -1, 0)
+            # line shape: (C, grid_dim, 1)
+            coords = jnp.stack([coord, jnp.zeros_like(coord)], axis=0)
+            interp_fn = lambda l: jax.scipy.ndimage.map_coordinates(
+                l, coords, order=1, mode="nearest"
+            )
+            return jax.vmap(interp_fn)(line)
 
         plane_xy = bilinear_interp(planes[0], x, y)
         line_z = linear_interp(lines[0], z)
@@ -162,7 +139,6 @@ class TensoRF(eqx.Module):
     def __call__(self, rays_o, rays_d, key, bg_color):
         n_samples = 192
 
-        # Let the grids remain in their native FP32 precision to safely accumulate tiny gradients
         den_planes = self.den_planes
         den_lines = self.den_lines
         app_planes = self.app_planes
@@ -185,7 +161,16 @@ class TensoRF(eqx.Module):
         grid_idx = jnp.clip(
             jnp.floor(pts_norm * alpha_res).astype(jnp.int32), 0, alpha_res - 1
         )
-        in_alpha = self.alpha_mask[grid_idx[:, 0], grid_idx[:, 1], grid_idx[:, 2]]
+
+        # --- FLATTENED TPU INDEXING ---
+        flat_idx = (
+            grid_idx[:, 0] * (alpha_res * alpha_res)
+            + grid_idx[:, 1] * alpha_res
+            + grid_idx[:, 2]
+        )
+        flat_mask = self.alpha_mask.flatten()
+        in_alpha = jnp.take(flat_mask, flat_idx)
+        # ------------------------------
 
         mask = valid_mask & in_alpha
         pts_norm = jnp.clip(pts_norm, 0.0, 1.0)
@@ -194,8 +179,6 @@ class TensoRF(eqx.Module):
             pts_norm, den_planes, den_lines
         )
         sigma = sum(jnp.sum(comp, axis=0) for comp in den_components)
-
-        # [FIX]: Use standard softplus without the extreme -10.0 bottleneck
         sigma = jax.nn.softplus(sigma)
 
         sigma = jnp.where(mask, sigma, 0.0)
@@ -212,7 +195,6 @@ class TensoRF(eqx.Module):
         )
         app_feats = jnp.concatenate(app_components, axis=0).T
 
-        # Keep the compute_dtype cast for the MLP inputs, as these gradients easily survive float16
         basis = self.basis_mat.astype(self.compute_dtype)
         app_feats_proj = app_feats @ basis
 

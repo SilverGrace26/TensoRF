@@ -248,12 +248,21 @@ def main(args):
                         )
                     )
 
+                    # --- SYNCHRONIZATION BARRIER ---
+                    losses.block_until_ready()
+                    # -------------------------------
+
                     current_step += run_steps
 
                     if losses.shape[-1] > 0:
                         final_loss = float(jnp.mean(losses[:, -1]))
                         final_mse = float(jnp.mean(mses[:, -1]))
                         psnr = -10.0 * np.log10(max(final_mse, 1e-10))
+
+                    pbar.set_postfix(
+                        {"Loss": f"{final_loss:.4f}", "PSNR": f"{psnr:.2f} dB"}
+                    )
+                    pbar.update(run_steps)
 
                     pbar.set_postfix(
                         {"Loss": f"{final_loss:.4f}", "PSNR": f"{psnr:.2f} dB"}
