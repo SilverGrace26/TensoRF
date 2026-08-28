@@ -8,18 +8,31 @@ from tqdm import tqdm
 from functools import partial
 
 
+def _pad_and_shard(array, n_devices):
+    """Helper to pad batched arrays so they divide evenly across devices."""
+    n = array.shape[0]
+    remainder = n % n_devices
+    pad_size = 0
+    if remainder != 0:
+        pad_size = n_devices - remainder
+        array = jnp.concatenate([array, array[:pad_size]], axis=0)
+    return array.reshape(n_devices, -1, array.shape[-1]), pad_size
+
+
 def evaluate_test_psnr(params, static_arrays, static, test_dataset, key=None):
     print("\n--- Running Test Set Evaluation ---")
 
     model_infer = eqx.combine(params, static_arrays, static)
+    n_devices = len(jax.local_devices())
 
-    @jax.jit
-    def render_chunk(rays_o_chunk, rays_d_chunk):
+    @partial(eqx.filter_pmap, in_axes=(None, 0, 0))
+    def render_chunk(model, rays_o_chunk, rays_d_chunk):
         bg_color = jnp.array([1.0, 1.0, 1.0])
-        rgb, _, _ = model_infer(rays_o_chunk, rays_d_chunk, None, bg_color)
+        rgb, _, _ = model(rays_o_chunk, rays_d_chunk, None, bg_color)
         return rgb
 
-    chunk_size = 8192
+    # Scale chunk up by device count to fully saturate hardware
+    chunk_size = 8192 * n_devices
     total_mse = 0.0
 
     for i in range(test_dataset.N):
@@ -35,7 +48,15 @@ def evaluate_test_psnr(params, static_arrays, static, test_dataset, key=None):
             chunk_o = jnp.array(flat_o[k : k + chunk_size])
             chunk_d = jnp.array(flat_d[k : k + chunk_size])
 
-            rgb_chunk = render_chunk(chunk_o, chunk_d)
+            chunk_o_sharded, pad_size = _pad_and_shard(chunk_o, n_devices)
+            chunk_d_sharded, _ = _pad_and_shard(chunk_d, n_devices)
+
+            rgb_chunk = render_chunk(model_infer, chunk_o_sharded, chunk_d_sharded)
+            rgb_chunk = rgb_chunk.reshape(-1, 3)
+
+            if pad_size > 0:
+                rgb_chunk = rgb_chunk[:-pad_size]
+
             pred_rgb_chunks.append(rgb_chunk)
 
         img_pred = jnp.concatenate(pred_rgb_chunks, axis=0)
@@ -144,14 +165,28 @@ def save_raw_planes(model, dir_out):
 
 
 def make_render_chunk_for_model(model):
-    @partial(jax.jit, static_argnames=("chunk",))
-    def render_chunk(rays_o, rays_d, chunk):
+    n_devices = len(jax.local_devices())
+
+    @partial(eqx.filter_pmap, in_axes=(None, 0, 0))
+    def render_chunk_pmap(model_infer, rays_o, rays_d):
         rays_o = jnp.reshape(rays_o, (-1, 3))
         rays_d = jnp.reshape(rays_d, (-1, 3))
-        rgb, _, _ = model(rays_o, rays_d, None, jnp.array([1.0, 1.0, 1.0]))
+        rgb, _, _ = model_infer(rays_o, rays_d, None, jnp.array([1.0, 1.0, 1.0]))
         return rgb
 
-    return render_chunk
+    def render_chunk_wrapper(rays_o, rays_d, chunk):
+        # We ignore 'chunk' here internally since we're sharding the full batch array
+        rays_o_sharded, pad_size = _pad_and_shard(rays_o, n_devices)
+        rays_d_sharded, _ = _pad_and_shard(rays_d, n_devices)
+
+        rgb_sharded = render_chunk_pmap(model, rays_o_sharded, rays_d_sharded)
+        rgb = rgb_sharded.reshape(-1, 3)
+
+        if pad_size > 0:
+            rgb = rgb[:-pad_size]
+        return rgb
+
+    return render_chunk_wrapper
 
 
 def render_360_video(model, dataset, out_dir, n_frames=30, chunk=8192):
@@ -163,6 +198,8 @@ def render_360_video(model, dataset, out_dir, n_frames=30, chunk=8192):
     z_elevation = base_pose[2, 3]
 
     render_chunk = make_render_chunk_for_model(model)
+    n_devices = len(jax.local_devices())
+    chunk = chunk * n_devices
 
     def get_rays(pose):
         i, j = np.meshgrid(np.arange(W), np.arange(H), indexing="xy")
