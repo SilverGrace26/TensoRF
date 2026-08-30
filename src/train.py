@@ -1,8 +1,8 @@
 import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["JAX_LOG_COMPILES"] = "1"
-os.environ["TF_CPP_MIN_VLOG_LEVEL"] = "3"
+# os.environ["JAX_LOG_COMPILES"] = "1"
+# os.environ["TF_CPP_MIN_VLOG_LEVEL"] = "3"
 
 import json
 import time

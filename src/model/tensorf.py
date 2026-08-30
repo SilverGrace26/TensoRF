@@ -89,27 +89,31 @@ class TensoRF(eqx.Module):
             return c0, c1, w
 
         def bilinear_interp(plane, coord_u, coord_v):
-            # plane: (C, grid_dim, grid_dim) -> single flat 1-D gather, no vmap
             C = plane.shape[0]
             u0, u1, wu = _corner_weights(coord_u)
             v0, v1, wv = _corner_weights(coord_v)
-            plane_flat = plane.reshape(C, grid_dim * grid_dim)
+
+            # Transpose to (V, C) for contiguous axis 0 gathers
+            plane_flat = plane.reshape(C, grid_dim * grid_dim).T
 
             def corner(vi, ui):
-                return jnp.take(plane_flat, vi * grid_dim + ui, axis=1)
+                return plane_flat[vi * grid_dim + ui]
 
-            c0 = corner(v0, u0) * (1 - wu) + corner(v0, u1) * wu
-            c1 = corner(v1, u0) * (1 - wu) + corner(v1, u1) * wu
-            return c0 * (1 - wv) + c1 * wv
+            c0 = corner(v0, u0) * (1 - wu)[..., None] + corner(v0, u1) * wu[..., None]
+            c1 = corner(v1, u0) * (1 - wu)[..., None] + corner(v1, u1) * wv[..., None]
+            return (c0 * (1 - wv)[..., None] + c1 * wv[..., None]).T
 
         def linear_interp(line, coord):
             C = line.shape[0]
             c0, c1, w = _corner_weights(coord)
-            line_flat = line.reshape(C, grid_dim)
-            return (
-                jnp.take(line_flat, c0, axis=1) * (1 - w)
-                + jnp.take(line_flat, c1, axis=1) * w
-            )
+
+            # Transpose to (V, C) for contiguous axis 0 gathers
+            line_flat = line.reshape(C, grid_dim).T
+
+            v0 = line_flat[c0]
+            v1 = line_flat[c1]
+
+            return (v0 * (1 - w)[..., None] + v1 * w[..., None]).T
 
         plane_xy = bilinear_interp(planes[0], x, y)
         line_z = linear_interp(lines[0], z)
@@ -121,11 +125,11 @@ class TensoRF(eqx.Module):
         return [plane_xy * line_z, plane_xz * line_y, plane_yz * line_x]
 
     def get_sigma_feat(self, xyz_normed):
-        # Let the grids remain in their native FP32 precision to safely accumulate tiny gradients
-        den_planes = self.den_planes
-        den_lines = self.den_lines
-        app_planes = self.app_planes
-        app_lines = self.app_lines
+        # Cast grids down to bfloat16 explicitly here to re-engage MXUs
+        den_planes = tuple(x.astype(self.compute_dtype) for x in self.den_planes)
+        den_lines = tuple(x.astype(self.compute_dtype) for x in self.den_lines)
+        app_planes = tuple(x.astype(self.compute_dtype) for x in self.app_planes)
+        app_lines = tuple(x.astype(self.compute_dtype) for x in self.app_lines)
 
         den_components = self.interpolate_tensor_components(
             xyz_normed, den_planes, den_lines
@@ -144,10 +148,11 @@ class TensoRF(eqx.Module):
     def __call__(self, rays_o, rays_d, key, bg_color):
         n_samples = 192
 
-        den_planes = self.den_planes
-        den_lines = self.den_lines
-        app_planes = self.app_planes
-        app_lines = self.app_lines
+        # Cast grids down to bfloat16 explicitly here
+        den_planes = tuple(x.astype(self.compute_dtype) for x in self.den_planes)
+        den_lines = tuple(x.astype(self.compute_dtype) for x in self.den_lines)
+        app_planes = tuple(x.astype(self.compute_dtype) for x in self.app_planes)
+        app_lines = tuple(x.astype(self.compute_dtype) for x in self.app_lines)
 
         near, far, hit_mask = compute_ray_aabb_intersections(
             rays_o, rays_d, self.bbox_min, self.bbox_max
@@ -204,9 +209,15 @@ class TensoRF(eqx.Module):
         app_feats_proj = app_feats @ basis
 
         view_dirs = rays_d / jnp.linalg.norm(rays_d, axis=-1, keepdims=True)
-        dirs_flat = view_dirs[:, None, :].repeat(n_samples, axis=1).reshape(-1, 3)
-        dirs_enc = encode_view_directions(dirs_flat)
-        dirs_enc = dirs_enc.astype(self.compute_dtype)
+
+        # Encode once per ray: (N_rays, 27)
+        dirs_enc_base = encode_view_directions(view_dirs).astype(self.compute_dtype)
+
+        # Broadcast to (N_rays, n_samples, 27) then flatten
+        dirs_enc = jnp.broadcast_to(
+            dirs_enc_base[:, None, :],
+            (rays_o.shape[0], n_samples, dirs_enc_base.shape[-1]),
+        ).reshape(-1, dirs_enc_base.shape[-1])
 
         mlp_input = jnp.concatenate([app_feats_proj, dirs_enc], axis=-1)
         rgb_flat_cast = jax.vmap(self.mlp_render)(mlp_input)
