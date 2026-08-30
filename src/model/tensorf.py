@@ -78,38 +78,43 @@ class TensoRF(eqx.Module):
         return jax.lax.stop_gradient((xyz - min_b) / (max_b - min_b))
 
     def interpolate_tensor_components(self, xyz_normed, planes, lines):
-        import jax.scipy.ndimage
-
         grid_dim = self.grid_dim
         scaled_coords = jax.lax.stop_gradient(xyz_normed * (grid_dim - 1))
+        x, y, z = scaled_coords[..., 0], scaled_coords[..., 1], scaled_coords[..., 2]
 
-        x = scaled_coords[..., 0]
-        y = scaled_coords[..., 1]
-        z = scaled_coords[..., 2]
+        def _corner_weights(coord):
+            c0 = jnp.clip(jnp.floor(coord), 0, grid_dim - 1).astype(jnp.int32)
+            c1 = jnp.clip(c0 + 1, 0, grid_dim - 1)
+            w = jnp.clip(coord - c0, 0.0, 1.0)
+            return c0, c1, w
 
         def bilinear_interp(plane, coord_u, coord_v):
-            # plane shape: (C, grid_dim, grid_dim)
-            coords = jnp.stack([coord_v, coord_u], axis=0)
-            # Map coordinates across the channel dimension
-            interp_fn = lambda p: jax.scipy.ndimage.map_coordinates(
-                p, coords, order=1, mode="nearest"
-            )
-            return jax.vmap(interp_fn)(plane)
+            # plane: (C, grid_dim, grid_dim) -> single flat 1-D gather, no vmap
+            C = plane.shape[0]
+            u0, u1, wu = _corner_weights(coord_u)
+            v0, v1, wv = _corner_weights(coord_v)
+            plane_flat = plane.reshape(C, grid_dim * grid_dim)
+
+            def corner(vi, ui):
+                return jnp.take(plane_flat, vi * grid_dim + ui, axis=1)
+
+            c0 = corner(v0, u0) * (1 - wu) + corner(v0, u1) * wu
+            c1 = corner(v1, u0) * (1 - wu) + corner(v1, u1) * wu
+            return c0 * (1 - wv) + c1 * wv
 
         def linear_interp(line, coord):
-            # line shape: (C, grid_dim, 1)
-            coords = jnp.stack([coord, jnp.zeros_like(coord)], axis=0)
-            interp_fn = lambda l: jax.scipy.ndimage.map_coordinates(
-                l, coords, order=1, mode="nearest"
+            C = line.shape[0]
+            c0, c1, w = _corner_weights(coord)
+            line_flat = line.reshape(C, grid_dim)
+            return (
+                jnp.take(line_flat, c0, axis=1) * (1 - w)
+                + jnp.take(line_flat, c1, axis=1) * w
             )
-            return jax.vmap(interp_fn)(line)
 
         plane_xy = bilinear_interp(planes[0], x, y)
         line_z = linear_interp(lines[0], z)
-
         plane_xz = bilinear_interp(planes[1], x, z)
         line_y = linear_interp(lines[1], y)
-
         plane_yz = bilinear_interp(planes[2], y, z)
         line_x = linear_interp(lines[2], x)
 
