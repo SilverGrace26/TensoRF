@@ -21,25 +21,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from core.dataset import DataLoader
 from core.losses import loss_fn
 from core.engine import pmap_train_block, restore_step_count
+from core.utils import device_put_sharded, device_put_replicated
 from model.tensorf import TensoRF, upsample_tensoRF, update_alpha_mask, shrink_bbox
 from visualization import evaluate_test_psnr
-
-
-def device_put_sharded(shards, devices):
-    mesh = Mesh(np.array(devices), ("x",))
-    sharding = NamedSharding(mesh, P("x"))
-    return jax.tree.map(lambda *xs: jax.device_put(jnp.stack(xs), sharding), *shards)
-
-
-def device_put_replicated(tree, devices):
-    mesh = Mesh(np.array(devices), ("x",))
-    sharding = NamedSharding(mesh, P("x"))
-    return jax.tree.map(
-        lambda x: jax.device_put(
-            jnp.broadcast_to(x, (len(devices),) + x.shape), sharding
-        ),
-        tree,
-    )
 
 
 def partition_model(model):

@@ -7,6 +7,8 @@ import imageio.v2 as imageio
 from tqdm import tqdm
 from functools import partial
 
+from core.utils import device_put_replicated
+
 
 def _pad_and_shard(array, n_devices):
     """Helper to pad batched arrays so they divide evenly across devices."""
@@ -25,13 +27,16 @@ def evaluate_test_psnr(params, static_arrays, static, test_dataset, key=None):
     model_infer = eqx.combine(params, static_arrays, static)
     n_devices = len(jax.local_devices())
 
-    @partial(eqx.filter_pmap, in_axes=(None, 0, 0))
+    # Pre-replicate the model once to avoid continuous broadcasting overhead
+    model_infer_rep = device_put_replicated(model_infer, jax.local_devices())
+
+    # Update in_axes so the model is no longer broadcast per dispatch
+    @partial(eqx.filter_pmap, in_axes=(0, 0, 0))
     def render_chunk(model, rays_o_chunk, rays_d_chunk):
         bg_color = jnp.array([1.0, 1.0, 1.0])
         rgb, _, _ = model(rays_o_chunk, rays_d_chunk, None, bg_color)
         return rgb
 
-    # Scale chunk up by device count to fully saturate hardware
     chunk_size = 8192 * n_devices
     total_mse = 0.0
 
@@ -51,7 +56,8 @@ def evaluate_test_psnr(params, static_arrays, static, test_dataset, key=None):
             chunk_o_sharded, pad_size = _pad_and_shard(chunk_o, n_devices)
             chunk_d_sharded, _ = _pad_and_shard(chunk_d, n_devices)
 
-            rgb_chunk = render_chunk(model_infer, chunk_o_sharded, chunk_d_sharded)
+            # Pass the pre-replicated model explicitly
+            rgb_chunk = render_chunk(model_infer_rep, chunk_o_sharded, chunk_d_sharded)
             rgb_chunk = rgb_chunk.reshape(-1, 3)
 
             if pad_size > 0:
@@ -167,7 +173,11 @@ def save_raw_planes(model, dir_out):
 def make_render_chunk_for_model(model):
     n_devices = len(jax.local_devices())
 
-    @partial(eqx.filter_pmap, in_axes=(None, 0, 0))
+    # Pre-replicate the model for the rendering closure
+    model_rep = device_put_replicated(model, jax.local_devices())
+
+    # Map the model correctly along axis 0
+    @partial(eqx.filter_pmap, in_axes=(0, 0, 0))
     def render_chunk_pmap(model_infer, rays_o, rays_d):
         rays_o = jnp.reshape(rays_o, (-1, 3))
         rays_d = jnp.reshape(rays_d, (-1, 3))
@@ -175,11 +185,11 @@ def make_render_chunk_for_model(model):
         return rgb
 
     def render_chunk_wrapper(rays_o, rays_d, chunk):
-        # We ignore 'chunk' here internally since we're sharding the full batch array
         rays_o_sharded, pad_size = _pad_and_shard(rays_o, n_devices)
         rays_d_sharded, _ = _pad_and_shard(rays_d, n_devices)
 
-        rgb_sharded = render_chunk_pmap(model, rays_o_sharded, rays_d_sharded)
+        # Utilize the replicated model inside the mapped function
+        rgb_sharded = render_chunk_pmap(model_rep, rays_o_sharded, rays_d_sharded)
         rgb = rgb_sharded.reshape(-1, 3)
 
         if pad_size > 0:

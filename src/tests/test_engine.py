@@ -8,26 +8,8 @@ import optax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from core.engine import pmap_train_block
+from core.utils import device_put_replicated, device_put_sharded
 from model.tensorf import TensoRF
-
-
-def device_put_replicated(tree, devices):
-    mesh = Mesh(np.array(devices), ("x",))
-    sharding = NamedSharding(mesh, P("x"))
-    return jax.tree.map(
-        lambda x: (
-            jax.device_put(jnp.broadcast_to(x, (len(devices),) + x.shape), sharding)
-            if isinstance(x, jax.Array)
-            else x
-        ),
-        tree,
-    )
-
-
-def device_put_sharded(shards, devices):
-    mesh = Mesh(np.array(devices), ("x",))
-    sharding = NamedSharding(mesh, P("x"))
-    return jax.tree.map(lambda *xs: jax.device_put(jnp.stack(xs), sharding), *shards)
 
 
 def test_pmap_train_block_execution():
