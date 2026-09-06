@@ -297,13 +297,8 @@ def main(args):
                 model = update_alpha_mask(model)
                 model = shrink_bbox(model)
 
-                model = eqx.tree_at(
-                    lambda m: m.alpha_mask,
-                    model,
-                    jax.device_put(jnp.ones_like(model.alpha_mask)),
-                )
-
                 model = upsample_tensoRF(model, new_dim, train_key)
+                model = update_alpha_mask(model)
                 params, static_arrays, static = partition_model(model)
 
                 new_opt_state = optimizer.init(params)
