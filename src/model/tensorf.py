@@ -100,7 +100,7 @@ class TensoRF(eqx.Module):
                 return plane_flat[vi * grid_dim + ui]
 
             c0 = corner(v0, u0) * (1 - wu)[..., None] + corner(v0, u1) * wu[..., None]
-            c1 = corner(v1, u0) * (1 - wu)[..., None] + corner(v1, u1) * wv[..., None]
+            c1 = corner(v1, u0) * (1 - wv)[..., None] + corner(v1, u1) * wv[..., None]
             return (c0 * (1 - wv)[..., None] + c1 * wv[..., None]).T
 
         def linear_interp(line, coord):
