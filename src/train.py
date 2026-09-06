@@ -10,6 +10,7 @@ import argparse
 import numpy as np
 import jax
 import jax.numpy as jnp
+import jax.profiler
 import equinox as eqx
 import optax
 import mlflow
@@ -213,6 +214,10 @@ def main(args):
                     if run_steps <= 0:
                         break
 
+                    if current_step == 1000:
+                        print("🔴 Starting JAX profiler trace...")
+                        jax.profiler.start_trace("/kaggle/working/tb_logs")
+
                     params_rep, opt_state_rep, device_keys, losses, mses = (
                         pmap_train_block(
                             params_rep,
@@ -237,6 +242,12 @@ def main(args):
                     # --- SYNCHRONIZATION BARRIER ---
                     losses.block_until_ready()
                     # -------------------------------
+
+                    if current_step == 1100:
+                        jax.profiler.stop_trace()
+                        print(
+                            "🛑 Stopped JAX profiler trace. Check /kaggle/working/tb_logs"
+                        )
 
                     current_step += run_steps
 
