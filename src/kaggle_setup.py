@@ -38,25 +38,31 @@ def main():
 
     # 2. Clear out Kaggle's pre-existing conflicting system packages
     print("Uninstalling conflicting system packages...")
-    run_cmd(f"{sys.executable} -m pip uninstall -y tensorflow numpy matplotlib")
+    run_cmd(
+        f"{sys.executable} -m pip uninstall -y tensorflow tensorflow-cpu numpy matplotlib tensorboard tensorboard-plugin-profile"
+    )
 
     # 3. Fast, single-pass reproducible installations using uv
     if accelerator == "TPU":
         print("Installing JAX for TPU using uv...")
         run_cmd(f"{uv_cmd} requests")
-        # Combined into one resolution pass!
+        # Combined into one resolution pass, now including the profiler stack!
         run_cmd(
-            f'{uv_cmd} -U "jax[tpu]" equinox optax "numpy<2.0.0" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html'
+            f'{uv_cmd} -U "jax[tpu]" equinox optax "numpy<2.0.0" tensorflow-cpu tensorboard-plugin-profile -f https://storage.googleapis.com/jax-releases/libtpu_releases.html'
         )
 
     elif accelerator == "GPU":
         print("Installing JAX for GPU (CUDA 12) using uv...")
         # Combined into one resolution pass!
-        run_cmd(f'{uv_cmd} -U "jax[cuda12]" equinox optax "numpy<2.0.0"')
+        run_cmd(
+            f'{uv_cmd} -U "jax[cuda12]" equinox optax "numpy<2.0.0" tensorflow-cpu tensorboard-plugin-profile'
+        )
 
     else:
         print("No accelerator detected. Installing standard CPU JAX using uv...")
-        run_cmd(f'{uv_cmd} -U jax jaxlib equinox optax "numpy<2.0.0"')
+        run_cmd(
+            f'{uv_cmd} -U jax jaxlib equinox optax "numpy<2.0.0" tensorflow-cpu tensorboard-plugin-profile'
+        )
 
     # 4. Install remaining dependencies with strict limits
     print("Resolving and installing standard dependencies...")

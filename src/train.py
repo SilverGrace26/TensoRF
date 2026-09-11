@@ -272,11 +272,11 @@ def main(args):
 
             mlflow.log_metrics(
                 {
-                    "train_loss": final_loss,
-                    "train_psnr": psnr,
-                    "grid_dim": initial_grid_dim,
+                    "train_loss": float(final_loss),
+                    "train_psnr": float(psnr),
+                    "grid_dim": int(initial_grid_dim),
                 },
-                step=next_upsample,
+                step=int(next_upsample),
             )
 
             if current_step in res_map:
