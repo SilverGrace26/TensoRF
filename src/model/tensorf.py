@@ -1,7 +1,6 @@
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-import jax.scipy
-import equinox as eqx
 import numpy as np
 from typing import Tuple
 
@@ -89,31 +88,32 @@ class TensoRF(eqx.Module):
             return c0, c1, w
 
         def bilinear_interp(plane, coord_u, coord_v):
-            C = plane.shape[0]
             u0, u1, wu = _corner_weights(coord_u)
             v0, v1, wv = _corner_weights(coord_v)
 
-            # Transpose to (V, C) for contiguous axis 0 gathers
-            plane_flat = plane.reshape(C, grid_dim * grid_dim).T
+            # Native multi-dimensional gather (plane: C, H, W -> out: C, N)
+            c00 = plane[:, v0, u0]
+            c01 = plane[:, v0, u1]
+            c10 = plane[:, v1, u0]
+            c11 = plane[:, v1, u1]
 
-            def corner(vi, ui):
-                return plane_flat[vi * grid_dim + ui]
+            wu_b = wu[None, :]
+            wv_b = wv[None, :]
 
-            c0 = corner(v0, u0) * (1 - wu)[..., None] + corner(v0, u1) * wu[..., None]
-            c1 = corner(v1, u0) * (1 - wv)[..., None] + corner(v1, u1) * wv[..., None]
-            return (c0 * (1 - wv)[..., None] + c1 * wv[..., None]).T
+            # Bilinear interpolation with correct horizontal and vertical weights
+            c0 = c00 * (1.0 - wu_b) + c01 * wu_b
+            c1 = c10 * (1.0 - wu_b) + c11 * wu_b
+            return c0 * (1.0 - wv_b) + c1 * wv_b
 
         def linear_interp(line, coord):
-            C = line.shape[0]
             c0, c1, w = _corner_weights(coord)
 
-            # Transpose to (V, C) for contiguous axis 0 gathers
-            line_flat = line.reshape(C, grid_dim).T
+            # Native multi-dimensional gather (line: C, H, 1 -> out: C, N)
+            v0 = line[:, c0, 0]
+            v1 = line[:, c1, 0]
+            w_b = w[None, :]
 
-            v0 = line_flat[c0]
-            v1 = line_flat[c1]
-
-            return (v0 * (1 - w)[..., None] + v1 * w[..., None]).T
+            return v0 * (1.0 - w_b) + v1 * w_b
 
         plane_xy = bilinear_interp(planes[0], x, y)
         line_z = linear_interp(lines[0], z)
@@ -125,7 +125,6 @@ class TensoRF(eqx.Module):
         return [plane_xy * line_z, plane_xz * line_y, plane_yz * line_x]
 
     def get_sigma_feat(self, xyz_normed):
-        # Cast grids down to bfloat16 explicitly here to re-engage MXUs
         den_planes = tuple(x.astype(self.compute_dtype) for x in self.den_planes)
         den_lines = tuple(x.astype(self.compute_dtype) for x in self.den_lines)
         app_planes = tuple(x.astype(self.compute_dtype) for x in self.app_planes)
@@ -135,8 +134,6 @@ class TensoRF(eqx.Module):
             xyz_normed, den_planes, den_lines
         )
         sigma = sum(jnp.sum(comp, axis=0) for comp in den_components)
-
-        # [FIX]: Use standard softplus without the extreme -10.0 bottleneck
         sigma = jax.nn.softplus(sigma)
 
         app_components = self.interpolate_tensor_components(
@@ -148,7 +145,6 @@ class TensoRF(eqx.Module):
     def __call__(self, rays_o, rays_d, key, bg_color):
         n_samples = 192
 
-        # Cast grids down to bfloat16 explicitly here
         den_planes = tuple(x.astype(self.compute_dtype) for x in self.den_planes)
         den_lines = tuple(x.astype(self.compute_dtype) for x in self.den_lines)
         app_planes = tuple(x.astype(self.compute_dtype) for x in self.app_planes)
@@ -172,25 +168,22 @@ class TensoRF(eqx.Module):
             jnp.floor(pts_norm * alpha_res).astype(jnp.int32), 0, alpha_res - 1
         )
 
-        # --- FLATTENED TPU INDEXING ---
-        flat_idx = (
-            grid_idx[:, 0] * (alpha_res * alpha_res)
-            + grid_idx[:, 1] * alpha_res
-            + grid_idx[:, 2]
-        )
-        flat_mask = self.alpha_mask.flatten()
-        in_alpha = jnp.take(flat_mask, flat_idx)
-        # ------------------------------
+        # Native 3D gather into alpha mask
+        in_alpha = self.alpha_mask[grid_idx[:, 0], grid_idx[:, 1], grid_idx[:, 2]]
 
         mask = valid_mask & in_alpha
         pts_norm = jnp.clip(pts_norm, 0.0, 1.0)
 
+        # Route empty points to (0, 0, 0) so TPU serves them via SRAM cache
+        pts_norm_masked = jnp.where(mask[..., None], pts_norm, 0.0)
+
         den_components = self.interpolate_tensor_components(
-            pts_norm, den_planes, den_lines
+            pts_norm_masked, den_planes, den_lines
         )
         sigma = sum(jnp.sum(comp, axis=0) for comp in den_components)
         sigma = jax.nn.softplus(sigma)
 
+        # Explicitly zero out masked sigma to sever gradient backpropagation
         sigma = jnp.where(mask, sigma, 0.0)
         sigma = sigma.reshape(rays_o.shape[0], n_samples)
 
@@ -201,23 +194,25 @@ class TensoRF(eqx.Module):
         dists = dists * jnp.linalg.norm(rays_d[..., None, :], axis=-1)
 
         app_components = self.interpolate_tensor_components(
-            pts_norm, app_planes, app_lines
+            pts_norm_masked, app_planes, app_lines
         )
         app_feats = jnp.concatenate(app_components, axis=0).T
+
+        # Zero out empty space before basis matrix multiplication
+        app_feats = jnp.where(mask[..., None], app_feats, 0.0)
 
         basis = self.basis_mat.astype(self.compute_dtype)
         app_feats_proj = app_feats @ basis
 
         view_dirs = rays_d / jnp.linalg.norm(rays_d, axis=-1, keepdims=True)
 
-        # Encode once per ray: (N_rays, 27)
         dirs_enc_base = encode_view_directions(view_dirs).astype(self.compute_dtype)
-
-        # Broadcast to (N_rays, n_samples, 27) then flatten
         dirs_enc = jnp.broadcast_to(
             dirs_enc_base[:, None, :],
             (rays_o.shape[0], n_samples, dirs_enc_base.shape[-1]),
         ).reshape(-1, dirs_enc_base.shape[-1])
+
+        dirs_enc = jnp.where(mask[..., None], dirs_enc, 0.0)
 
         mlp_input = jnp.concatenate([app_feats_proj, dirs_enc], axis=-1)
         rgb_flat_cast = jax.vmap(self.mlp_render)(mlp_input)
