@@ -19,8 +19,19 @@ def compute_tv_loss(planes, lines):
     return tv
 
 
-def loss_fn(model, rays_o, rays_d, target_rgb, key, tv_weight, l1_weight, bg_color):
-    pred_rgb, _, weights = model(rays_o, rays_d, key, bg_color)
+def loss_fn(
+    model,
+    rays_o,
+    rays_d,
+    dirs_enc,
+    rays_d_norm,
+    target_rgb,
+    key,
+    tv_weight,
+    l1_weight,
+    bg_color,
+):
+    pred_rgb, _, weights = model(rays_o, rays_d, key, bg_color, dirs_enc, rays_d_norm)
     mse_loss = jnp.mean((pred_rgb - target_rgb) ** 2)
 
     tv_den = compute_tv_loss(model.den_planes, model.den_lines)

@@ -91,7 +91,6 @@ class TensoRF(eqx.Module):
             u0, u1, wu = _corner_weights(coord_u)
             v0, v1, wv = _corner_weights(coord_v)
 
-            # Native multi-dimensional gather (plane: C, H, W -> out: C, N)
             c00 = plane[:, v0, u0]
             c01 = plane[:, v0, u1]
             c10 = plane[:, v1, u0]
@@ -100,7 +99,6 @@ class TensoRF(eqx.Module):
             wu_b = wu[None, :]
             wv_b = wv[None, :]
 
-            # Bilinear interpolation with correct horizontal and vertical weights
             c0 = c00 * (1.0 - wu_b) + c01 * wu_b
             c1 = c10 * (1.0 - wu_b) + c11 * wu_b
             return c0 * (1.0 - wv_b) + c1 * wv_b
@@ -108,7 +106,6 @@ class TensoRF(eqx.Module):
         def linear_interp(line, coord):
             c0, c1, w = _corner_weights(coord)
 
-            # Native multi-dimensional gather (line: C, H, 1 -> out: C, N)
             v0 = line[:, c0, 0]
             v1 = line[:, c1, 0]
             w_b = w[None, :]
@@ -142,7 +139,7 @@ class TensoRF(eqx.Module):
         app_feats = jnp.concatenate(app_components, axis=0).T
         return sigma, app_feats
 
-    def __call__(self, rays_o, rays_d, key, bg_color):
+    def __call__(self, rays_o, rays_d, key, bg_color, dirs_enc=None, rays_d_norm=None):
         n_samples = 192
 
         den_planes = tuple(x.astype(self.compute_dtype) for x in self.den_planes)
@@ -168,13 +165,11 @@ class TensoRF(eqx.Module):
             jnp.floor(pts_norm * alpha_res).astype(jnp.int32), 0, alpha_res - 1
         )
 
-        # Native 3D gather into alpha mask
         in_alpha = self.alpha_mask[grid_idx[:, 0], grid_idx[:, 1], grid_idx[:, 2]]
 
         mask = valid_mask & in_alpha
         pts_norm = jnp.clip(pts_norm, 0.0, 1.0)
 
-        # Route empty points to (0, 0, 0) so TPU serves them via SRAM cache
         pts_norm_masked = jnp.where(mask[..., None], pts_norm, 0.0)
 
         den_components = self.interpolate_tensor_components(
@@ -183,7 +178,6 @@ class TensoRF(eqx.Module):
         sigma = sum(jnp.sum(comp, axis=0) for comp in den_components)
         sigma = jax.nn.softplus(sigma)
 
-        # Explicitly zero out masked sigma to sever gradient backpropagation
         sigma = jnp.where(mask, sigma, 0.0)
         sigma = sigma.reshape(rays_o.shape[0], n_samples)
 
@@ -191,26 +185,35 @@ class TensoRF(eqx.Module):
         dists = jnp.concatenate(
             [dists, jnp.broadcast_to(1e10, dists[..., :1].shape)], -1
         )
-        dists = dists * jnp.linalg.norm(rays_d[..., None, :], axis=-1)
+
+        # Bypass TPU norm calculation using CPU precomputations when available
+        if rays_d_norm is None:
+            rays_d_norm = jnp.linalg.norm(rays_d, axis=-1)
+        dists = dists * rays_d_norm[..., None]
 
         app_components = self.interpolate_tensor_components(
             pts_norm_masked, app_planes, app_lines
         )
         app_feats = jnp.concatenate(app_components, axis=0).T
-
-        # Zero out empty space before basis matrix multiplication
         app_feats = jnp.where(mask[..., None], app_feats, 0.0)
 
         basis = self.basis_mat.astype(self.compute_dtype)
         app_feats_proj = app_feats @ basis
 
-        view_dirs = rays_d / jnp.linalg.norm(rays_d, axis=-1, keepdims=True)
-
-        dirs_enc_base = encode_view_directions(view_dirs).astype(self.compute_dtype)
-        dirs_enc = jnp.broadcast_to(
-            dirs_enc_base[:, None, :],
-            (rays_o.shape[0], n_samples, dirs_enc_base.shape[-1]),
-        ).reshape(-1, dirs_enc_base.shape[-1])
+        # Bypass TPU trig functions using CPU precomputations when available
+        if dirs_enc is None:
+            view_dirs = rays_d / rays_d_norm[..., None]
+            dirs_enc_base = encode_view_directions(view_dirs).astype(self.compute_dtype)
+            dirs_enc = jnp.broadcast_to(
+                dirs_enc_base[:, None, :],
+                (rays_o.shape[0], n_samples, dirs_enc_base.shape[-1]),
+            ).reshape(-1, dirs_enc_base.shape[-1])
+        else:
+            dirs_enc = jnp.broadcast_to(
+                dirs_enc[:, None, :],
+                (rays_o.shape[0], n_samples, dirs_enc.shape[-1]),
+            ).reshape(-1, dirs_enc.shape[-1])
+            dirs_enc = dirs_enc.astype(self.compute_dtype)
 
         dirs_enc = jnp.where(mask[..., None], dirs_enc, 0.0)
 

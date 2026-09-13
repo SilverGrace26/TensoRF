@@ -1,8 +1,6 @@
 import os
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-# os.environ["JAX_LOG_COMPILES"] = "1"
-# os.environ["TF_CPP_MIN_VLOG_LEVEL"] = "3"
 
 import json
 import time
@@ -17,10 +15,7 @@ import mlflow
 import dagshub
 from tqdm import tqdm
 
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-
 from core.dataset import DataLoader
-from core.losses import loss_fn
 from core.engine import pmap_train_block, restore_step_count
 from core.utils import device_put_sharded, device_put_replicated
 from model.tensorf import TensoRF, upsample_tensoRF, update_alpha_mask, shrink_bbox
@@ -177,16 +172,10 @@ def main(args):
             opt_state = optimizer.init(params)
 
         print("\nReplicating parameters across hardware devices...")
-        H, W = dataset.H, dataset.W
-        imgs_jax = jnp.array(dataset.imgs)
-        rays_o_jax = jnp.array(dataset.rays_o)
-        rays_d_jax = jnp.array(dataset.rays_d)
-
         params_rep = device_put_replicated(params, devices)
         opt_state_rep = device_put_replicated(opt_state, devices)
 
         print("Starting optimized block loop...")
-
         device_keys_list = list(jax.random.split(train_key, n_devices))
         device_keys = device_put_sharded(device_keys_list, devices)
 
@@ -194,7 +183,6 @@ def main(args):
 
         for next_upsample in schedule:
             steps_in_block = next_upsample - current_step
-
             if steps_in_block <= 0:
                 continue
 
@@ -206,8 +194,8 @@ def main(args):
 
             print(f"\nTargeting Step {next_upsample} (Upsample Bound)...")
             start_time = time.time()
-
             chunk_size = 100
+
             with tqdm(total=steps_in_block, desc="Training") as pbar:
                 while current_step < next_upsample:
                     run_steps = min(chunk_size, next_upsample - current_step)
@@ -218,6 +206,17 @@ def main(args):
                         print("🔴 Starting JAX profiler trace...")
                         jax.profiler.start_trace("/kaggle/working/tb_logs")
 
+                    is_precrop = current_step < 1000
+                    ro, rd, de, rn, rgb = dataset.get_training_chunk(
+                        run_steps, BATCH_SIZE_PER_DEVICE, n_devices, is_precrop
+                    )
+
+                    ro_jax = device_put_sharded(list(np.swapaxes(ro, 0, 1)), devices)
+                    rd_jax = device_put_sharded(list(np.swapaxes(rd, 0, 1)), devices)
+                    de_jax = device_put_sharded(list(np.swapaxes(de, 0, 1)), devices)
+                    rn_jax = device_put_sharded(list(np.swapaxes(rn, 0, 1)), devices)
+                    rgb_jax = device_put_sharded(list(np.swapaxes(rgb, 0, 1)), devices)
+
                     params_rep, opt_state_rep, device_keys, losses, mses = (
                         pmap_train_block(
                             params_rep,
@@ -225,23 +224,19 @@ def main(args):
                             static_arrays,
                             static,
                             device_keys,
-                            imgs_jax,
-                            rays_o_jax,
-                            rays_d_jax,
-                            H,
-                            W,
-                            current_step,
+                            ro_jax,
+                            rd_jax,
+                            de_jax,
+                            rn_jax,
+                            rgb_jax,
                             run_steps,
                             actual_tv_lambda,
                             optimizer,
-                            BATCH_SIZE_PER_DEVICE,
                             args.verbose,
                         )
                     )
 
-                    # --- SYNCHRONIZATION BARRIER ---
                     losses.block_until_ready()
-                    # -------------------------------
 
                     if current_step == 1100:
                         jax.profiler.stop_trace()
@@ -255,11 +250,6 @@ def main(args):
                         final_loss = float(jnp.mean(losses[:, -1]))
                         final_mse = float(jnp.mean(mses[:, -1]))
                         psnr = -10.0 * np.log10(max(final_mse, 1e-10))
-
-                    pbar.set_postfix(
-                        {"Loss": f"{final_loss:.4f}", "PSNR": f"{psnr:.2f} dB"}
-                    )
-                    pbar.update(run_steps)
 
                     pbar.set_postfix(
                         {"Loss": f"{final_loss:.4f}", "PSNR": f"{psnr:.2f} dB"}
@@ -333,7 +323,6 @@ def main(args):
         test_psnr = evaluate_test_psnr(
             params_final, static_arrays, static, test_dataset
         )
-
         mlflow.log_metric("test_psnr", test_psnr, step=args.n_iters)
 
 
@@ -369,5 +358,4 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-
     main(args)
