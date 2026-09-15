@@ -172,6 +172,11 @@ def main(args):
             opt_state = optimizer.init(params)
 
         print("\nReplicating parameters across hardware devices...")
+        H, W = dataset.H, dataset.W
+        imgs_jax = jnp.array(dataset.imgs)
+        rays_o_jax = jnp.array(dataset.rays_o)
+        rays_d_jax = jnp.array(dataset.rays_d)
+
         params_rep = device_put_replicated(params, devices)
         opt_state_rep = device_put_replicated(opt_state, devices)
 
@@ -206,17 +211,6 @@ def main(args):
                         print("🔴 Starting JAX profiler trace...")
                         jax.profiler.start_trace("/kaggle/working/tb_logs")
 
-                    is_precrop = current_step < 1000
-                    ro, rd, de, rn, rgb = dataset.get_training_chunk(
-                        run_steps, BATCH_SIZE_PER_DEVICE, n_devices, is_precrop
-                    )
-
-                    ro_jax = device_put_sharded(list(np.swapaxes(ro, 0, 1)), devices)
-                    rd_jax = device_put_sharded(list(np.swapaxes(rd, 0, 1)), devices)
-                    de_jax = device_put_sharded(list(np.swapaxes(de, 0, 1)), devices)
-                    rn_jax = device_put_sharded(list(np.swapaxes(rn, 0, 1)), devices)
-                    rgb_jax = device_put_sharded(list(np.swapaxes(rgb, 0, 1)), devices)
-
                     params_rep, opt_state_rep, device_keys, losses, mses = (
                         pmap_train_block(
                             params_rep,
@@ -224,14 +218,16 @@ def main(args):
                             static_arrays,
                             static,
                             device_keys,
-                            ro_jax,
-                            rd_jax,
-                            de_jax,
-                            rn_jax,
-                            rgb_jax,
+                            imgs_jax,
+                            rays_o_jax,
+                            rays_d_jax,
+                            H,
+                            W,
+                            current_step,
                             run_steps,
                             actual_tv_lambda,
                             optimizer,
+                            BATCH_SIZE_PER_DEVICE,
                             args.verbose,
                         )
                     )

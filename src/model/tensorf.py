@@ -88,29 +88,30 @@ class TensoRF(eqx.Module):
             return c0, c1, w
 
         def bilinear_interp(plane, coord_u, coord_v):
+            C = plane.shape[0]
             u0, u1, wu = _corner_weights(coord_u)
             v0, v1, wv = _corner_weights(coord_v)
 
-            c00 = plane[:, v0, u0]
-            c01 = plane[:, v0, u1]
-            c10 = plane[:, v1, u0]
-            c11 = plane[:, v1, u1]
+            # Flatten spatial axes so TPU sees one simple gather axis.
+            plane_flat = plane.reshape(C, grid_dim * grid_dim).T
 
-            wu_b = wu[None, :]
-            wv_b = wv[None, :]
+            def corner(vi, ui):
+                return plane_flat[vi * grid_dim + ui]
 
-            c0 = c00 * (1.0 - wu_b) + c01 * wu_b
-            c1 = c10 * (1.0 - wu_b) + c11 * wu_b
-            return c0 * (1.0 - wv_b) + c1 * wv_b
+            c0 = corner(v0, u0) * (1.0 - wu)[..., None] + corner(v0, u1) * wu[..., None]
+            # Important: interpolate BOTH rows along u with wu. The old fast
+            # implementation used wv here, which is a bilinear interpolation bug.
+            c1 = corner(v1, u0) * (1.0 - wu)[..., None] + corner(v1, u1) * wu[..., None]
+            return (c0 * (1.0 - wv)[..., None] + c1 * wv[..., None]).T
 
         def linear_interp(line, coord):
+            C = line.shape[0]
             c0, c1, w = _corner_weights(coord)
 
-            v0 = line[:, c0, 0]
-            v1 = line[:, c1, 0]
-            w_b = w[None, :]
-
-            return v0 * (1.0 - w_b) + v1 * w_b
+            line_flat = line.reshape(C, grid_dim).T
+            v0 = line_flat[c0]
+            v1 = line_flat[c1]
+            return (v0 * (1.0 - w)[..., None] + v1 * w[..., None]).T
 
         plane_xy = bilinear_interp(planes[0], x, y)
         line_z = linear_interp(lines[0], z)
@@ -121,25 +122,28 @@ class TensoRF(eqx.Module):
 
         return [plane_xy * line_z, plane_xz * line_y, plane_yz * line_x]
 
-    def get_sigma_feat(self, xyz_normed):
+    def get_sigma(self, xyz_normed):
+        """Density-only query used by occupancy-grid updates."""
         den_planes = tuple(x.astype(self.compute_dtype) for x in self.den_planes)
         den_lines = tuple(x.astype(self.compute_dtype) for x in self.den_lines)
-        app_planes = tuple(x.astype(self.compute_dtype) for x in self.app_planes)
-        app_lines = tuple(x.astype(self.compute_dtype) for x in self.app_lines)
-
         den_components = self.interpolate_tensor_components(
             xyz_normed, den_planes, den_lines
         )
         sigma = sum(jnp.sum(comp, axis=0) for comp in den_components)
-        sigma = jax.nn.softplus(sigma)
+        return jax.nn.softplus(sigma)
 
+    def get_sigma_feat(self, xyz_normed):
+        sigma = self.get_sigma(xyz_normed)
+
+        app_planes = tuple(x.astype(self.compute_dtype) for x in self.app_planes)
+        app_lines = tuple(x.astype(self.compute_dtype) for x in self.app_lines)
         app_components = self.interpolate_tensor_components(
             xyz_normed, app_planes, app_lines
         )
         app_feats = jnp.concatenate(app_components, axis=0).T
         return sigma, app_feats
 
-    def __call__(self, rays_o, rays_d, key, bg_color, dirs_enc=None, rays_d_norm=None):
+    def __call__(self, rays_o, rays_d, key, bg_color):
         n_samples = 192
 
         den_planes = tuple(x.astype(self.compute_dtype) for x in self.den_planes)
@@ -165,15 +169,18 @@ class TensoRF(eqx.Module):
             jnp.floor(pts_norm * alpha_res).astype(jnp.int32), 0, alpha_res - 1
         )
 
-        in_alpha = self.alpha_mask[grid_idx[:, 0], grid_idx[:, 1], grid_idx[:, 2]]
+        flat_idx = (
+            grid_idx[:, 0] * (alpha_res * alpha_res)
+            + grid_idx[:, 1] * alpha_res
+            + grid_idx[:, 2]
+        )
+        in_alpha = jnp.take(self.alpha_mask.reshape(-1), flat_idx)
 
         mask = valid_mask & in_alpha
         pts_norm = jnp.clip(pts_norm, 0.0, 1.0)
 
-        pts_norm_masked = jnp.where(mask[..., None], pts_norm, 0.0)
-
         den_components = self.interpolate_tensor_components(
-            pts_norm_masked, den_planes, den_lines
+            pts_norm, den_planes, den_lines
         )
         sigma = sum(jnp.sum(comp, axis=0) for comp in den_components)
         sigma = jax.nn.softplus(sigma)
@@ -186,36 +193,25 @@ class TensoRF(eqx.Module):
             [dists, jnp.broadcast_to(1e10, dists[..., :1].shape)], -1
         )
 
-        # Bypass TPU norm calculation using CPU precomputations when available
-        if rays_d_norm is None:
-            rays_d_norm = jnp.linalg.norm(rays_d, axis=-1)
+        # Compute the ray norm once on-device; this is tiny compared with the
+        # 192-sample interpolation/MLP workload and avoids host->TPU traffic.
+        rays_d_norm = jnp.linalg.norm(rays_d, axis=-1)
         dists = dists * rays_d_norm[..., None]
 
         app_components = self.interpolate_tensor_components(
-            pts_norm_masked, app_planes, app_lines
+            pts_norm, app_planes, app_lines
         )
         app_feats = jnp.concatenate(app_components, axis=0).T
-        app_feats = jnp.where(mask[..., None], app_feats, 0.0)
 
         basis = self.basis_mat.astype(self.compute_dtype)
         app_feats_proj = app_feats @ basis
 
-        # Bypass TPU trig functions using CPU precomputations when available
-        if dirs_enc is None:
-            view_dirs = rays_d / rays_d_norm[..., None]
-            dirs_enc_base = encode_view_directions(view_dirs).astype(self.compute_dtype)
-            dirs_enc = jnp.broadcast_to(
-                dirs_enc_base[:, None, :],
-                (rays_o.shape[0], n_samples, dirs_enc_base.shape[-1]),
-            ).reshape(-1, dirs_enc_base.shape[-1])
-        else:
-            dirs_enc = jnp.broadcast_to(
-                dirs_enc[:, None, :],
-                (rays_o.shape[0], n_samples, dirs_enc.shape[-1]),
-            ).reshape(-1, dirs_enc.shape[-1])
-            dirs_enc = dirs_enc.astype(self.compute_dtype)
-
-        dirs_enc = jnp.where(mask[..., None], dirs_enc, 0.0)
+        view_dirs = rays_d / rays_d_norm[..., None]
+        dirs_enc_base = encode_view_directions(view_dirs).astype(self.compute_dtype)
+        dirs_enc = jnp.broadcast_to(
+            dirs_enc_base[:, None, :],
+            (rays_o.shape[0], n_samples, dirs_enc_base.shape[-1]),
+        ).reshape(-1, dirs_enc_base.shape[-1])
 
         mlp_input = jnp.concatenate([app_feats_proj, dirs_enc], axis=-1)
         rgb_flat_cast = jax.vmap(self.mlp_render)(mlp_input)
@@ -235,25 +231,22 @@ def update_alpha_mask(model):
 
     @jax.jit
     def get_sigma(pts):
-        sigma, _ = model.get_sigma_feat(pts)
-        return sigma
+        return model.get_sigma(pts)
 
+    # Keep density chunks on-device and synchronize only once after thresholding.
+    # The previous code copied every chunk to NumPy and also computed appearance
+    # features that the occupancy update never used.
     sigmas = []
     chunk = res * res
     for i in range(0, pts_norm.shape[0], chunk):
-        pts_chunk = pts_norm[i : i + chunk]
-        sigmas.append(np.array(get_sigma(pts_chunk)))
+        sigmas.append(get_sigma(pts_norm[i : i + chunk]))
 
-    sigma_grid = np.concatenate(sigmas, axis=0)
-
-    extent = np.linalg.norm(np.array(model.bbox_max) - np.array(model.bbox_min))
+    sigma_grid = jnp.concatenate(sigmas, axis=0)
+    extent = jnp.linalg.norm(model.bbox_max - model.bbox_min)
     step_size = extent / 192.0
 
-    alpha = 1.0 - np.exp(-sigma_grid * step_size)
-    mask_flat = alpha > 0.0001
-    mask = mask_flat.reshape(res, res, res)
-
-    new_mask = jax.device_put(jnp.array(mask))
+    alpha = 1.0 - jnp.exp(-sigma_grid * step_size)
+    new_mask = (alpha > 0.0001).reshape(res, res, res)
     return eqx.tree_at(lambda m: m.alpha_mask, model, new_mask)
 
 
@@ -306,10 +299,12 @@ def shrink_bbox(model):
         l_x = lines[2][:, ix0:ix1, :]
         return (jnp.array(l_z), jnp.array(l_y), jnp.array(l_x))
 
-    new_den_planes = crop_planes([np.array(p) for p in model.den_planes])
-    new_den_lines = crop_lines([np.array(l) for l in model.den_lines])
-    new_app_planes = crop_planes([np.array(p) for p in model.app_planes])
-    new_app_lines = crop_lines([np.array(l) for l in model.app_lines])
+    # Slice device arrays directly. Converting every factor to NumPy here forces
+    # large device->host copies immediately before sending the cropped arrays back.
+    new_den_planes = crop_planes(model.den_planes)
+    new_den_lines = crop_lines(model.den_lines)
+    new_app_planes = crop_planes(model.app_planes)
+    new_app_lines = crop_lines(model.app_lines)
 
     model = eqx.tree_at(
         lambda m: m.bbox_min, model, jax.device_put(jnp.array(new_bbox_min))

@@ -35,19 +35,14 @@ def test_pmap_train_block_execution():
     device_keys_list = list(jax.random.split(train_key, n_devices))
     device_keys = device_put_sharded(device_keys_list, devices)
 
+    num_imgs = (2,)
+    H, W = 16, 16
     batch_size_per_device = 2
     num_steps = 1
 
-    # Match the new pmap input shapes
-    shape_3d = (n_devices, num_steps, batch_size_per_device, 3)
-    shape_27d = (n_devices, num_steps, batch_size_per_device, 27)
-    shape_1d = (n_devices, num_steps, batch_size_per_device)
-
-    batch_rays_o = jnp.ones(shape_3d, dtype=jnp.float32)
-    batch_rays_d = jnp.ones(shape_3d, dtype=jnp.float32)
-    batch_dirs_enc = jnp.ones(shape_27d, dtype=jnp.float32)
-    batch_norms = jnp.ones(shape_1d, dtype=jnp.float32)
-    batch_rgb = jnp.ones(shape_3d, dtype=jnp.float32)
+    imgs = jnp.ones((num_imgs, H, W, 3), dtype=jnp.float32)
+    rays_o = jnp.ones((num_imgs, H, W, 3), dtype=jnp.float32)
+    rays_d = jnp.ones((num_imgs, H, W, 3), dtype=jnp.float32)
 
     new_params, new_opt, new_keys, loss, mse = pmap_train_block(
         params_rep,
@@ -55,14 +50,16 @@ def test_pmap_train_block_execution():
         static_arrays,
         static,
         device_keys,
-        batch_rays_o,
-        batch_rays_d,
-        batch_dirs_enc,
-        batch_norms,
-        batch_rgb,
+        imgs,
+        rays_o,
+        rays_d,
+        H,
+        W,
+        0,
         num_steps,
         0.1,
         optimizer,
+        batch_size_per_device,
         False,
     )
 

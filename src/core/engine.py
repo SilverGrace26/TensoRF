@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import equinox as eqx
 from functools import partial
 from core.losses import loss_fn
+from geometry.rays import sample_batch_on_device
 
 
 def restore_step_count(new_opt_state, old_opt_state):
@@ -27,8 +28,25 @@ def restore_step_count(new_opt_state, old_opt_state):
 @partial(
     jax.pmap,
     axis_name="devices",
-    in_axes=(0, 0, None, None, 0, 0, 0, 0, 0, 0, None, None, None, None),
-    static_broadcasted_argnums=(3, 10, 12, 13),
+    in_axes=(
+        0,
+        0,
+        None,
+        None,
+        0,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ),
+    static_broadcasted_argnums=(3, 8, 9, 11, 13, 14, 15),
 )
 def pmap_train_block(
     params,
@@ -36,21 +54,36 @@ def pmap_train_block(
     static_arrays,
     static,
     rng,
-    batch_rays_o,
-    batch_rays_d,
-    batch_dirs_enc,
-    batch_norms,
-    batch_rgb,
+    imgs,
+    rays_o_all,
+    rays_d_all,
+    H,
+    W,
+    start_step,
     num_steps,
     tv_weight,
     optimizer,
+    batch_size_per_device,
     verbose,
 ):
-    def step_fn(carry, step_data):
+    def step_fn(carry, step_idx):
         p, opt, current_rng = carry
-        current_rng, model_key = jax.random.split(current_rng, 2)
+        current_rng, sample_key, model_key = jax.random.split(current_rng, 3)
 
-        rays_o, rays_d, dirs_enc, norms, target_rgb = step_data
+        global_step = start_step + step_idx
+        is_precrop = gloabl_step < 1000
+
+        rays_o, rays_d, target_rgb = sample_batch_on_device(
+            sample_key,
+            imgs,
+            rays_o_all,
+            rays_d_all,
+            H,
+            W,
+            is_precrop,
+            batch_size_per_device,
+        )
+
         model_local = eqx.combine(p, static_arrays, static)
 
         def loss_func(m):
@@ -58,8 +91,6 @@ def pmap_train_block(
                 m,
                 rays_o,
                 rays_d,
-                dirs_enc,
-                norms,
                 target_rgb,
                 model_key,
                 tv_weight,
@@ -76,7 +107,8 @@ def pmap_train_block(
             max_app_grad = jnp.max(jnp.abs(grads.app_planes[0]))
             reg_loss = loss - mse
             jax.debug.print(
-                "MSE: {:.4f} | Reg: {:.4f} | DenGrad: {:.2e} | AppGrad: {:.2e}",
+                "Step {} | MSE: {:.4f} | Reg: {:.4f} | DenGrad: {:.2e} | AppGrad: {:.2e}",
+                global_step,
                 mse,
                 reg_loss,
                 max_den_grad,
@@ -90,8 +122,7 @@ def pmap_train_block(
         return (new_p, new_opt, current_rng), (loss, mse)
 
     init_carry = (params, opt_state, rng)
-    step_data = (batch_rays_o, batch_rays_d, batch_dirs_enc, batch_norms, batch_rgb)
-    final_carry, metrics = jax.lax.scan(step_fn, init_carry, step_data)
+    final_carry, metrics = jax.lax.scan(step_fn, init_carry, jnp.arange(num_steps))
 
     final_params, final_opt, final_rng = final_carry
     return final_params, final_opt, final_rng, metrics[0], metrics[1]
