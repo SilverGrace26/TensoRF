@@ -351,7 +351,17 @@ def main(args):
         print(f"Final grid dimension: {initial_grid_dim}")
         print("============================================================")
 
-        params_final = jax.tree_util.tree_map(lambda x: x[0], params_rep)
+        # 1. Isolate final parameters by forcing a clean copy to prevent view-invalidation
+        params_final = jax.tree_util.tree_map(lambda x: jnp.copy(x[0]), params_rep)
+
+        # 2. Obliterate massive replicated training buffers from TPU physical memory
+        jax.tree_util.tree_map(
+            lambda x: x.delete() if hasattr(x, "delete") else None, opt_state_rep
+        )
+        jax.tree_util.tree_map(
+            lambda x: x.delete() if hasattr(x, "delete") else None, params_rep
+        )
+        jax.clear_caches()
         test_psnr = evaluate_test_psnr(
             params_final, static_arrays, static, test_dataset
         )
