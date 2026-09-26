@@ -136,7 +136,8 @@ class TensoRF(eqx.Module):
         )
         sigma = sum(jnp.sum(comp, axis=0) for comp in den_components)
 
-        sigma = jax.nn.softplus(sigma - 10.0)
+        # [FIX]: Use standard softplus without the extreme -10.0 bottleneck
+        sigma = jax.nn.softplus(sigma)
 
         app_components = self.interpolate_tensor_components(
             xyz_normed, app_planes, app_lines
@@ -190,7 +191,7 @@ class TensoRF(eqx.Module):
             pts_norm, den_planes, den_lines
         )
         sigma = sum(jnp.sum(comp, axis=0) for comp in den_components)
-        sigma = jax.nn.softplus(sigma - 10.0)
+        sigma = jax.nn.softplus(sigma)
 
         sigma = jnp.where(mask, sigma, 0.0)
         sigma = sigma.reshape(rays_o.shape[0], n_samples)
