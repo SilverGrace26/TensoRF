@@ -112,19 +112,19 @@ def main(args):
         warmup_steps = min(1000, max(1, args.n_iters // 2))
         schedule_decay_steps = max(args.n_iters, warmup_steps + 1)
 
-        lr_schedule_grids = optax.warmup_cosine_decay_schedule(
+        lr_schedule_grids = optax.warmup_exponential_decay_schedule(
             init_value=2e-3,
             peak_value=2e-2,
             warmup_steps=warmup_steps,
-            decay_steps=schedule_decay_steps,
-            end_value=2e-3,
+            transition_steps=args.n_iters,
+            decay_rate=0.1,
         )
-        lr_schedule_mlp = optax.warmup_cosine_decay_schedule(
+        lr_schedule_mlp = optax.warmup_exponential_decay_schedule(
             init_value=1e-4,
             peak_value=1e-3,
             warmup_steps=warmup_steps,
-            decay_steps=schedule_decay_steps,
-            end_value=1e-4,
+            transition_steps=args.n_iters,
+            decay_rate=0.1,
         )
 
         optim_grids = optax.adam(lr_schedule_grids, b1=0.9, b2=0.99)
