@@ -148,7 +148,7 @@ class TensoRF(eqx.Module):
     def __call__(self, rays_o, rays_d, key, bg_color):
         # Tie the ray step count directly to the current grid resolution
         # Multiplier of 1.5 ensures the Nyquist sampling theorem is respected
-        n_samples = int(self.grid_dim * 1.5)
+        n_samples = min(int(self.grid_dim * 1.5), 384)
 
         # Cast grids down to bfloat16 explicitly here
         den_planes = tuple(x.astype(self.compute_dtype) for x in self.den_planes)
