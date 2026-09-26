@@ -308,6 +308,15 @@ def main(args):
 
                 new_opt_state = optimizer.init(params)
                 old_state_single = jax.tree_util.tree_map(lambda x: x[0], opt_state_rep)
+
+                def preserve_mlp_state(new_tree, old_tree):
+                    return eqx.tree_at(
+                        lambda t: t[1].inner_states["mlp"],
+                        new_tree,
+                        old_tree[1].inner_states["mlp"],
+                    )
+
+                new_opt_state = preserve_mlp_state(new_opt_state, old_state_single)
                 opt_state = restore_step_count(new_opt_state, old_state_single)
 
                 params_rep = device_put_replicated(params, devices)
