@@ -309,15 +309,23 @@ def main(args):
                 new_opt_state = optimizer.init(params)
                 old_state_single = jax.tree_util.tree_map(lambda x: x[0], opt_state_rep)
 
-                def preserve_mlp_state(new_tree, old_tree):
-                    return eqx.tree_at(
-                        lambda t: t[1].inner_states["mlp"],
-                        new_tree,
-                        old_tree[1].inner_states["mlp"],
-                    )
+                # Flatten both states to bypass JAX static field structure checks
+                new_leaves, new_treedef = jax.tree_util.tree_flatten(new_opt_state)
+                old_leaves, _ = jax.tree_util.tree_flatten(old_state_single)
 
-                new_opt_state = preserve_mlp_state(new_opt_state, old_state_single)
-                opt_state = restore_step_count(new_opt_state, old_state_single)
+                # Transplant momentum/counts for parameters that did not change shape (MLP, Basis)
+                merged_leaves = []
+                for new_l, old_l in zip(new_leaves, old_leaves):
+                    if (
+                        hasattr(new_l, "shape")
+                        and hasattr(old_l, "shape")
+                        and new_l.shape == old_l.shape
+                    ):
+                        merged_leaves.append(old_l)
+                    else:
+                        merged_leaves.append(new_l)
+
+                opt_state = jax.tree_util.tree_unflatten(new_treedef, merged_leaves)
 
                 params_rep = device_put_replicated(params, devices)
                 opt_state_rep = device_put_replicated(opt_state, devices)
