@@ -19,6 +19,21 @@ def _pad_and_shard(array, n_devices):
     return array.reshape(n_devices, -1, array.shape[-1]), pad_size
 
 
+def get_safe_chunk_size(model):
+    """Calculates a memory-safe ray chunk size based on hardware and grid resolution."""
+    backend = jax.default_backend()
+
+    base_budget_per_core = 4096 if backend == "gpu" else 256
+
+    n_samples = min(int(model.grid_dim * 1.5), 384)
+
+    scale_factor = 192.0 / n_samples
+    safe_chunk = int(base_budget_per_core * scale_factor)
+
+    # Round down to the nearest multiple of 128 for efficient XLA compiler padding
+    return max(128, safe_chunk - (safe_chunk % 128))
+
+
 def evaluate_test_psnr(params, static_arrays, static, test_dataset, key=None):
     print("\n--- Running Test Set Evaluation ---")
 
@@ -32,7 +47,7 @@ def evaluate_test_psnr(params, static_arrays, static, test_dataset, key=None):
         return rgb
 
     # Scale chunk up by device count to fully saturate hardware
-    chunk_size = 8192 * n_devices
+    chunk_size = get_safe_chunk_size(model_infer) * n_devices
     total_mse = 0.0
 
     for i in range(test_dataset.N):
@@ -189,7 +204,7 @@ def make_render_chunk_for_model(model):
     return render_chunk_wrapper
 
 
-def render_360_video(model, dataset, out_dir, n_frames=30, chunk=8192):
+def render_360_video(model, dataset, out_dir, n_frames=30, chunk=None):
     print("\n→ Rendering 360° video frames…")
     H, W = dataset.H, dataset.W
     base_pose = dataset.poses[0]
@@ -199,7 +214,8 @@ def render_360_video(model, dataset, out_dir, n_frames=30, chunk=8192):
 
     render_chunk = make_render_chunk_for_model(model)
     n_devices = len(jax.local_devices())
-    chunk = chunk * n_devices
+    if chunk is None:
+        chunk = get_safe_chunk_size(model) * n_devices
 
     def get_rays(pose):
         i, j = np.meshgrid(np.arange(W), np.arange(H), indexing="xy")
