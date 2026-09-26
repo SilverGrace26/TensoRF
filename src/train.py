@@ -266,11 +266,6 @@ def main(args):
                     )
                     pbar.update(run_steps)
 
-                    pbar.set_postfix(
-                        {"Loss": f"{final_loss:.4f}", "PSNR": f"{psnr:.2f} dB"}
-                    )
-                    pbar.update(run_steps)
-
             print(
                 f"Reached Step {next_upsample} | Final Step Loss: {final_loss:.5f} | PSNR: {psnr:.2f} dB | Time: {time.time() - start_time:.1f}s"
             )
