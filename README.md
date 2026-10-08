@@ -2,7 +2,7 @@
 
 This repository contains a high-performance, TPU-optimized implementation of [TensoRF](https://www.google.com/search?q=https://arxiv.org/abs/2203.09517&utm_source=gemini) written in JAX and Equinox. It enables ultra-fast radiance field training by factorizing the 3D scene representation into lightweight tensor components.
 
-**[[Kaggle Notebook Placeholder]]()** | **[[360° Video Render Placeholder]](https://www.google.com/search?q=%23&utm_source=gemini)**
+- Kaggle Notebook : **[TensoRF Notebook](https://www.kaggle.com/code/blackflash26/tensorf)**  
 
 ## Results
 
@@ -10,6 +10,8 @@ This repository contains a high-performance, TPU-optimized implementation of [Te
 * **Hardware:** TPU v5e-8
 * **Performance:** **30 dB Test PSNR**
 * **Training Time:** **~45 minutes**
+
+![360° View](./assets/360_view.webp)  
 
 ## Core Approach
 
